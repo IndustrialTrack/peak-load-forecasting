@@ -20,14 +20,14 @@ from prophet_pipeline import (
 # =============================================================================
 # НАСТРОЙКИ
 # =============================================================================
-CSV_FILE   = "electricity_75.csv"      
-CACHE_FILE = "electricity_clean.pkl"   
+CSV_FILE   = "electricity_75.csv"       # путь к сырому CSV
+CACHE_FILE = "electricity_clean.pkl"    # кэш очищенного датасета
 REGION     = "Челябинская область"
 TARGET_COL = "actual_consumption"
 OUTPUT_DIR = "output"
 
-TEST_DAYS  = 30   
-HIT_RATE_K = 3    
+TEST_DAYS  = 30   # сколько последних дней использовать как тест
+HIT_RATE_K = 3    # размер топ-часов (по ТЗ = 3)
 
 
 # =============================================================================
