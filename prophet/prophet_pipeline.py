@@ -167,19 +167,6 @@ def split_train_val_test(df: pd.DataFrame, val_days: int = 30, test_days: int = 
 def rolling_origin_folds(df: pd.DataFrame, n_folds: int = 5,
                           horizon_days: int = 1, step_days: int = 14,
                           min_train_days: int = 180):
-    """
-    Walk-forward (rolling-origin) бэктест — надёжнее одного train/test
-    разбиения: модель переобучается и проверяется несколько раз на разных
-    "срезах" времени, что даёт среднюю точность и её разброс, а не
-    случайное число по одному удачному/неудачному куску истории.
-
-        Fold 1: train[........] -> test[день 1]
-        Fold 2: train[...........] -> test[день 2]   (сдвиг на step_days)
-        Fold 3: train[..............] -> test[день 3]
-        ...
-
-    Возвращает список (train_df, test_df) по каждому фолду.
-    """
     folds = []
     last_day = df.index.max().normalize()
     first_possible_cutoff = df.index.min() + pd.Timedelta(days=min_train_days)
@@ -222,17 +209,7 @@ def russian_holidays(years) -> pd.DataFrame:
 # 5. МОДЕЛЬ: Prophet, либо Fourier-GAM эквивалент как offline fallback
 # =============================================================================
 class _FourierGAM:
-    """
-    Воспроизводит математическую суть Prophet без самой библиотеки:
-
-        y(t) = тренд(t) + сезонность_год(t) + сезонность_нед(t)
-               + сезонность_сутки(t) + праздники(t) + b*price(t) + ошибка
-
-    Сезонности — суммы синусов/косинусов (ряд Фурье), как у настоящего
-    Prophet. Коэффициенты подбираются Ridge-регрессией (аналог MAP-оценки
-    со штрафом, которую Prophet делает через L-BFGS). Доверительный
-    интервал строится по эмпирическому разбросу остатков того же часа суток.
-    """
+    
     def __init__(self, yearly_order=6, weekly_order=3, daily_order=6,
                  interval_width=0.8, alpha=1.0, holidays=None, **_ignored):
         self.yearly_order = yearly_order
