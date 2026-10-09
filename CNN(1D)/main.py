@@ -190,6 +190,11 @@ def load_data(path):
         .apply(parse_numeric)
     )
 
+    # The source dataset also contains the operator's planned consumption,
+    # which is the known forecast we can compare against on the same test hours.
+    if "planned_consumption" in df.columns:
+        df["planned_consumption"] = df["planned_consumption"].apply(parse_numeric)
+
     # Remove invalid datetime / target rows
     df = df.dropna(
         subset=["datetime", "actual_consumption"]
@@ -213,9 +218,10 @@ def load_data(path):
         )
 
     # Keep only required columns
-    result = df[
-        ["datetime", "actual_consumption"]
-    ].copy()
+    columns = ["datetime", "actual_consumption"]
+    if "planned_consumption" in df.columns:
+        columns.append("planned_consumption")
+    result = df[columns].copy()
 
     result = result.set_index("datetime")
 
@@ -576,11 +582,7 @@ def evaluate_model(model, scaler, df, test_df):
         history_start:test_end
     ].copy()
 
-    actual_values = (
-        evaluation_df[
-            "actual_consumption"
-        ].values
-    )
+    actual_values = evaluation_df["actual_consumption"].values
 
     scaled_values = scaler.transform(
         actual_values.reshape(-1, 1)
@@ -653,29 +655,48 @@ def evaluate_model(model, scaler, df, test_df):
     # Metrics
     # --------------------------------------------------------
 
-    mae = mean_absolute_error(
-        actual,
-        predictions
-    )
-
-    rmse = np.sqrt(
-        mean_squared_error(
-            actual,
-            predictions
-        )
-    )
-
-    print(f"MAE:  {mae:.2f} MWh")
-    print(f"RMSE: {rmse:.2f} MWh")
-
     prediction_index = pd.date_range(
         start=test_start,
         periods=len(actual),
         freq="h",
     )
+    comparison = pd.DataFrame({
+        "actual_consumption": actual,
+        "cnn_prediction": predictions,
+    }, index=prediction_index)
+    comparison.index.name = "datetime"
+
+    def print_metrics(label, predicted, actual_values):
+        mae_value = mean_absolute_error(actual_values, predicted)
+        rmse_value = np.sqrt(mean_squared_error(actual_values, predicted))
+        mape_value = np.mean(np.abs((actual_values - predicted) / actual_values)) * 100
+        print(f"{label}: MAE={mae_value:.2f} MWh, RMSE={rmse_value:.2f} MWh, MAPE={mape_value:.2f}%, условная точность={100 - mape_value:.2f}%")
+        return mae_value, rmse_value, mape_value
+
+    print_metrics("CNN 1D", predictions, actual)
+
+    if "planned_consumption" in evaluation_df.columns:
+        planned = evaluation_df["planned_consumption"].reindex(prediction_index).to_numpy()
+        comparison["planned_forecast"] = planned
+        valid = np.isfinite(planned) & np.isfinite(actual) & (actual != 0)
+        if valid.any():
+            print(f"Сравнение выполнено на {valid.sum():,} общих часах.")
+            print_metrics("Известный план (planned_consumption)", planned[valid], actual[valid])
+            print_metrics("CNN 1D на тех же часах", predictions[valid], actual[valid])
+        else:
+            print("В тестовом периоде нет валидных значений planned_consumption для сравнения.")
+    else:
+        print("В CSV нет столбца planned_consumption; сравнение с известным прогнозом недоступно.")
+
+    comparison_path = os.path.join(RESULTS_DIR, "test_comparison.csv")
+    comparison.to_csv(comparison_path, encoding="utf-8-sig")
+    print(f"Таблица факта, CNN и плана сохранена: {comparison_path}")
+
     fig, ax = plt.subplots(figsize=(14, 6))
-    ax.plot(prediction_index, actual, label="Actual consumption", linewidth=1)
-    ax.plot(prediction_index, predictions, label="CNN prediction", linewidth=1)
+    ax.plot(prediction_index, actual, label="Фактическое потребление", linewidth=1)
+    ax.plot(prediction_index, predictions, label="CNN 1D", linewidth=1)
+    if "planned_forecast" in comparison:
+        ax.plot(prediction_index, comparison["planned_forecast"], label="Известный план", linewidth=1, alpha=0.8)
     ax.set_title("Actual vs predicted consumption on test data")
     ax.set_xlabel("Time")
     ax.set_ylabel("Consumption, MWh")
@@ -688,7 +709,7 @@ def evaluate_model(model, scaler, df, test_df):
     plt.close(fig)
     print(f"Test prediction plot saved to: {filename}")
 
-    return mae, rmse
+    return comparison
 
 
 # ============================================================
