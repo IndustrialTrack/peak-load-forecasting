@@ -14,16 +14,16 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 BASE_URL = "https://br.so-ups.ru/webapi/api/map/MapPartial"
 POWER_SYSTEM_ID = 630000
-SUBJECT_ID = "71"
-REGION_NAME = "Тюменская область"
-START_DATE = date(2022, 1, 1)
+SUBJECT_ID = "75"
+REGION_NAME = "Челябинская область"
+START_DATE = date(2026, 7, 29) 
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 OUTPUT_FILE = f"electricity_{SUBJECT_ID}.csv"
 LOG_FILE = f"electricity_{SUBJECT_ID}.log"
 
 REQUEST_TIMEOUT = 30
 MAX_RETRIES = 5
-REQUEST_DELAY = 0.6
+REQUEST_DELAY = 0.2
 
 CSV_COLUMNS = [
     "date", "hour", "region_name", "planned_consumption",
