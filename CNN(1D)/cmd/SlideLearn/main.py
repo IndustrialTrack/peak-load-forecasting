@@ -21,7 +21,7 @@ from tensorflow.keras.layers import Input, Conv1D, Dense, Flatten, Dropout
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 DATA_PATH = os.path.join(
-    BASE_DIR, "..", "datasets", "electricity_71.csv"
+    BASE_DIR, "../../../", "datasets", "electricity_75.csv"
 )
 
 RESULTS_DIR = os.path.join(BASE_DIR, "results")
@@ -84,8 +84,7 @@ def parse_numeric(value):
 def load_data():
     df = pd.read_csv(
         DATA_PATH,
-        sep=None,
-        engine="python",
+        sep=",",
         encoding="utf-8-sig",
     )
 
@@ -138,10 +137,24 @@ def load_data():
     df = df.reindex(full_index)
     df.index.name = "datetime"
 
+    # Fill short internal gaps in the hourly series (for example, a few
+    # missing consumption values in the source CSV) using time interpolation.
+    missing_count = int(df["actual_consumption"].isna().sum())
+    if missing_count:
+        df["actual_consumption"] = df["actual_consumption"].interpolate(
+            method="time",
+            limit=3,
+            limit_area="inside",
+        )
+        filled_count = missing_count - int(
+            df["actual_consumption"].isna().sum()
+        )
+        print(f"Interpolated missing hourly values: {filled_count}")
+
     if df["actual_consumption"].isna().any():
         raise ValueError(
-            "Missing hourly consumption values detected. "
-            "Fix or interpolate missing values before training."
+            "Unfilled hourly consumption values remain after interpolation. "
+            "Check for long gaps or missing values at the dataset boundaries."
         )
 
     print(f"Dataset: {df.index.min()} -> {df.index.max()}")
