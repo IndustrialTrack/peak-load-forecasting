@@ -1,7 +1,6 @@
 
 import os
 import re
-
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -10,70 +9,80 @@ import tensorflow as tf
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
-from tensorflow.keras import Sequential
-from tensorflow.keras.layers import Input, Conv1D, Dense, Flatten, Dropout
-
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-DATA_PATH = os.path.join(
-    BASE_DIR, "..", "datasets", "electricity_71.csv"
+ROOT_DIR = os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__))
 )
 
-RESULTS_DIR = os.path.join(BASE_DIR, "results")
-MODEL_DIR = os.path.join(BASE_DIR, "models")
+DATA_PATH = os.path.join(
+    ROOT_DIR,
+    "datasets",
+    "electricity_75.csv"
+)
+
+RESULTS_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "results",
+    "SlideLearn"
+)
+
+MODEL_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "models",
+    "SlideLearn"
+)
 
 WINDOW_SIZE = 168
 FORECAST_HORIZON = 24
 
-# Initial model training
-INITIAL_TRAIN_START = "2022-01-01"
+INITIAL_TRAIN_START = "2022-01-01 00:00:00"
 INITIAL_TRAIN_END = "2023-12-31 23:00:00"
 
-# Walk-forward evaluation
-TEST_START = "2024-01-01"
+TEST_START = "2024-01-01 00:00:00"
 TEST_END = "2026-07-31 23:00:00"
 
-# Rolling training window: last 2 years of available history
 TRAINING_WINDOW_DAYS = 730
 
-# Training parameters
 INITIAL_EPOCHS = 20
 ROLLING_EPOCHS = 1
 BATCH_SIZE = 32
 
 RANDOM_SEED = 42
 
-np.random.seed(RANDOM_SEED)
-tf.random.set_seed(RANDOM_SEED)
-
 os.makedirs(RESULTS_DIR, exist_ok=True)
 os.makedirs(MODEL_DIR, exist_ok=True)
+
+np.random.seed(RANDOM_SEED)
+tf.random.set_seed(RANDOM_SEED)
 
 
 # ============================================================
 # DATA LOADING
 # ============================================================
 
-def parse_numeric(value):
+def read_csv(path):
+    """Читает CSV с поддержкой нескольких распространённых кодировок."""
+    try:
+        return pd.read_csv(path, encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        return pd.read_csv(path, encoding="cp1251")
+
+
+def parse_number(value):
+    """Преобразует значения вроде '4 076 МВт*ч' в число 4076."""
     if pd.isna(value):
         return np.nan
 
-    value = str(value).strip()
-    value = value.replace("\xa0", " ")
-    value = value.replace("МВт*ч", "")
-    value = value.replace("МВт·ч", "")
-    value = value.replace(" ", "")
+    if isinstance(value, (int, float, np.number)):
+        return float(value)
+
+    value = str(value).replace("\xa0", " ")
     value = value.replace(",", ".")
-
-    value = re.sub(r"[^0-9.\-]", "", value)
-
-    if value in ("", "-", "."):
-        return np.nan
+    value = re.sub(r"[^0-9.\-]", "", value.replace(" ", ""))
 
     try:
         return float(value)
@@ -82,96 +91,126 @@ def parse_numeric(value):
 
 
 def load_data():
-    df = pd.read_csv(
-        DATA_PATH,
-        sep=None,
-        engine="python",
-        encoding="utf-8-sig",
-    )
-
-    df.columns = [
-        str(c).replace("\ufeff", "").strip().lower()
-        for c in df.columns
-    ]
-
-    required = {"date", "hour", "actual_consumption"}
-
-    if not required.issubset(df.columns):
-        raise ValueError(
-            f"Missing columns: {required - set(df.columns)}"
+    if not os.path.exists(DATA_PATH):
+        raise FileNotFoundError(
+            f"Файл с данными не найден: {DATA_PATH}"
         )
 
-    df["hour"] = (
-        df["hour"]
-        .astype(str)
-        .str.extract(r"(\d+)", expand=False)
-        .astype(int)
+    df = read_csv(DATA_PATH)
+
+    df.columns = (
+        df.columns.astype(str)
+        .str.replace("\ufeff", "", regex=False)
+        .str.strip()
+        .str.lower()
     )
 
-    df["datetime"] = pd.to_datetime(
-        df["date"].astype(str)
-        + " "
-        + df["hour"].astype(str).str.zfill(2),
-        format="%Y-%m-%d %H",
-        errors="coerce",
+    required = {"date", "hour", "actual_consumption"}
+    missing = required - set(df.columns)
+
+    if missing:
+        raise ValueError(
+            f"В CSV отсутствуют столбцы: {sorted(missing)}"
+        )
+
+    # Поддерживаем как числовой час, так и строковые значения.
+    hours = (
+        df["hour"]
+        .astype(str)
+        .str.extract(r"(\d+)")[0]
+    )
+
+    df["hour"] = pd.to_numeric(hours, errors="coerce")
+    df["date"] = pd.to_datetime(
+        df["date"],
+        errors="coerce"
     )
 
     df["actual_consumption"] = (
-        df["actual_consumption"].apply(parse_numeric)
+        df["actual_consumption"].apply(parse_number)
     )
 
     df = df.dropna(
-        subset=["datetime", "actual_consumption"]
+        subset=["date", "hour", "actual_consumption"]
+    ).copy()
+
+    df["hour"] = df["hour"].astype(int)
+
+    df["datetime"] = (
+        df["date"]
+        + pd.to_timedelta(df["hour"], unit="h")
     )
 
     df = df.sort_values("datetime")
-    df = df.drop_duplicates("datetime", keep="first")
+    df = df.drop_duplicates("datetime", keep="last")
     df = df.set_index("datetime")
 
-    # Require continuous hourly data.
+    series = df["actual_consumption"].astype(float).sort_index()
+
+    if series.empty:
+        raise ValueError("После обработки CSV не осталось данных.")
+
+    # Проверяем непрерывность почасового ряда.
     full_index = pd.date_range(
-        df.index.min(),
-        df.index.max(),
-        freq="h",
+        start=series.index.min(),
+        end=series.index.max(),
+        freq="h"
     )
 
-    df = df.reindex(full_index)
-    df.index.name = "datetime"
+    series = series.reindex(full_index)
 
-    if df["actual_consumption"].isna().any():
+    if series.isna().any():
+        missing_count = int(series.isna().sum())
+
         raise ValueError(
-            "Missing hourly consumption values detected. "
-            "Fix or interpolate missing values before training."
+            f"В почасовом ряду обнаружено {missing_count} пропусков. "
+            "Проверь исходный CSV перед обучением."
         )
 
-    print(f"Dataset: {df.index.min()} -> {df.index.max()}")
-    print(f"Total hours: {len(df):,}")
+    series.name = "actual_consumption"
 
-    return df[["actual_consumption"]]
+    print("\nДанные загружены.")
+    print(f"Количество часов: {len(series):,}")
+    print(f"Начало ряда: {series.index.min()}")
+    print(f"Конец ряда:  {series.index.max()}")
+
+    return series
 
 
 # ============================================================
-# CREATE TRAINING WINDOWS
+# SEQUENCE GENERATION
 # ============================================================
 
-def create_windows(values):
+def create_sequences(values):
+    """
+    Формирует обучающие примеры:
+    X — предыдущие 168 часов;
+    y — следующие 24 часа.
+    """
     X = []
     y = []
 
-    max_start = (
+    for i in range(
         len(values) - WINDOW_SIZE - FORECAST_HORIZON + 1
-    )
+    ):
+        X.append(
+            values[i:i + WINDOW_SIZE]
+        )
 
-    for start in range(max_start):
-        end = start + WINDOW_SIZE
-
-        X.append(values[start:end])
-        y.append(values[end:end + FORECAST_HORIZON])
+        y.append(
+            values[
+                i + WINDOW_SIZE:
+                i + WINDOW_SIZE + FORECAST_HORIZON
+            ].flatten()
+        )
 
     X = np.asarray(X, dtype=np.float32)
     y = np.asarray(y, dtype=np.float32)
 
-    X = X[..., np.newaxis]
+    if len(X) == 0:
+        raise ValueError(
+            "Недостаточно данных для создания обучающих примеров."
+        )
 
     return X, y
 
@@ -181,302 +220,418 @@ def create_windows(values):
 # ============================================================
 
 def create_model():
-    model = Sequential([
-        Input(shape=(WINDOW_SIZE, 1)),
+    model = tf.keras.Sequential([
+        tf.keras.layers.Input(
+            shape=(WINDOW_SIZE, 1)
+        ),
 
-        Conv1D(
+        tf.keras.layers.Conv1D(
+            filters=64,
+            kernel_size=3,
+            padding="causal",
+            activation="relu"
+        ),
+
+        tf.keras.layers.Conv1D(
             filters=32,
             kernel_size=3,
-            padding="same",
-            activation="relu",
+            padding="causal",
+            activation="relu"
         ),
 
-        Conv1D(
-            filters=64,
-            kernel_size=3,
-            padding="same",
-            activation="relu",
+        tf.keras.layers.Flatten(),
+
+        tf.keras.layers.Dense(
+            64,
+            activation="relu"
         ),
 
-        Conv1D(
-            filters=64,
-            kernel_size=3,
-            padding="same",
-            activation="relu",
-        ),
-
-        Flatten(),
-
-        Dense(128, activation="relu"),
-
-        Dropout(0.2),
-
-        Dense(FORECAST_HORIZON),
+        tf.keras.layers.Dense(
+            FORECAST_HORIZON
+        )
     ])
 
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(
-            learning_rate=0.001
-        ),
+        optimizer="adam",
         loss="mse",
-        metrics=["mae"],
+        metrics=["mae"]
     )
 
     return model
 
 
 # ============================================================
-# ROLLING TRAINING
+# SLIDELEARN: ROLLING TRAINING
 # ============================================================
 
-def rolling_training(df):
+def rolling_training(series):
     initial_start = pd.Timestamp(INITIAL_TRAIN_START)
     initial_end = pd.Timestamp(INITIAL_TRAIN_END)
 
     test_start = pd.Timestamp(TEST_START)
     test_end = pd.Timestamp(TEST_END)
 
-    # The initial training period must precede the test period.
-    initial_df = df.loc[initial_start:initial_end].copy()
+    initial_series = series.loc[
+        (series.index >= initial_start)
+        & (series.index <= initial_end)
+    ]
 
-    if initial_df.empty:
-        raise ValueError("Initial training dataset is empty.")
-
-    if initial_df.index.max() >= test_start:
+    if len(initial_series) < WINDOW_SIZE + FORECAST_HORIZON:
         raise ValueError(
-            "Initial training data must end before TEST_START."
+            "Недостаточно данных для начального обучения."
         )
 
-    if df.index.min() > initial_start or df.index.max() < test_end:
-        raise ValueError(
-            "The dataset does not cover the configured date range."
-        )
-
-    # Fit the scaler only on initial training data.
-    # Keep it fixed throughout the experiment.
+    # Масштабировщик обучается один раз.
+    # Далее он используется во всех шагах эксперимента.
     scaler = StandardScaler()
 
-    scaler.fit(
-        initial_df[["actual_consumption"]].to_numpy()
+    initial_scaled = scaler.fit_transform(
+        initial_series.to_numpy().reshape(-1, 1)
     )
 
-    initial_values = scaler.transform(
-        initial_df[["actual_consumption"]].to_numpy()
-    ).flatten()
-
-    X_initial, y_initial = create_windows(initial_values)
-
-    if len(X_initial) == 0:
-        raise ValueError("Not enough data for initial training.")
+    X_train, y_train = create_sequences(initial_scaled)
 
     model = create_model()
 
-    print("\nINITIAL TRAINING")
-    print(f"Training examples: {len(X_initial):,}")
+    print("\nНачальное обучение CNN...")
+    print(f"Обучающих примеров: {len(X_train):,}")
 
-    model.fit(
-        X_initial,
-        y_initial,
+    initial_history = model.fit(
+        X_train,
+        y_train,
         epochs=INITIAL_EPOCHS,
         batch_size=BATCH_SIZE,
         shuffle=False,
-        verbose=1,
+        verbose=1
     )
+
+    # Сохраняем метрики каждой эпохи.
+    history_rows = []
+
+    for epoch in range(len(initial_history.history["loss"])):
+        history_rows.append({
+            "stage": "initial",
+            "step": epoch + 1,
+            "loss": initial_history.history["loss"][epoch],
+            "mae": initial_history.history["mae"][epoch]
+        })
 
     predictions = []
     actual_values = []
-    prediction_dates = []
+    timestamps = []
 
-    # Start at the first complete forecast day.
-    forecast_start = test_start.normalize()
+    test_days = pd.date_range(
+        start=test_start.normalize(),
+        end=test_end.normalize(),
+        freq="D"
+    )
 
-    print("\nROLLING TRAINING AND FORECASTING")
+    print("\nНачинается скользящее обучение...")
 
-    while (
-        forecast_start + pd.Timedelta(hours=23) <= test_end
-    ):
-        forecast_end = (
-            forecast_start
-            + pd.Timedelta(hours=FORECAST_HORIZON - 1)
-        )
+    for day_number, day in enumerate(test_days, start=1):
+        day_start = day
+        day_end = day + pd.Timedelta(hours=23)
 
-        # Only data available BEFORE the forecast may be used
-        # for training and input preparation.
-        available_end = forecast_start - pd.Timedelta(hours=1)
-
-        # A fixed-size rolling training period.
-        training_start = max(
-            initial_start,
-            available_end
-            - pd.Timedelta(days=TRAINING_WINDOW_DAYS)
-            + pd.Timedelta(hours=1),
-        )
-
-        training_df = df.loc[
-            training_start:available_end
+        # Для каждого прогноза доступны только данные до начала суток.
+        available_history = series.loc[
+            series.index < day_start
         ]
 
-        # Train using the latest available historical data.
-        training_values = scaler.transform(
-            training_df[["actual_consumption"]].to_numpy()
-        ).flatten()
+        if len(available_history) < WINDOW_SIZE:
+            continue
 
-        X_train, y_train = create_windows(training_values)
+        training_start = day_start - pd.Timedelta(
+            days=TRAINING_WINDOW_DAYS
+        )
 
-        if len(X_train) == 0:
-            raise ValueError(
-                f"Not enough training data on {forecast_start}."
-            )
+        rolling_series = available_history.loc[
+            available_history.index >= training_start
+        ]
 
-        # Update existing weights instead of initializing a new CNN.
-        model.fit(
-            X_train,
-            y_train,
+        # Для ежедневного дообучения нужно достаточно примеров.
+        if len(rolling_series) < WINDOW_SIZE + FORECAST_HORIZON:
+            continue
+
+        # Используем тот же scaler, что и при начальном обучении.
+        rolling_scaled = scaler.transform(
+            rolling_series.to_numpy().reshape(-1, 1)
+        )
+
+        X_roll, y_roll = create_sequences(rolling_scaled)
+
+        # Продолжаем обучение той же модели с текущими весами.
+        rolling_history = model.fit(
+            X_roll,
+            y_roll,
             epochs=ROLLING_EPOCHS,
             batch_size=BATCH_SIZE,
             shuffle=False,
-            verbose=0,
+            verbose=0
         )
 
-        # Latest 168 actual hours before the forecast.
-        history_start = (
-            forecast_start - pd.Timedelta(hours=WINDOW_SIZE)
+        for epoch in range(len(rolling_history.history["loss"])):
+            history_rows.append({
+                "stage": "rolling",
+                "step": len(history_rows) + 1,
+                "loss": rolling_history.history["loss"][epoch],
+                "mae": rolling_history.history["mae"][epoch]
+            })
+
+        # Последние 168 часов перед прогнозируемыми сутками.
+        input_values = available_history.iloc[
+            -WINDOW_SIZE:
+        ].to_numpy().reshape(-1, 1)
+
+        scaled_input = scaler.transform(input_values)
+
+        X_input = scaled_input.reshape(
+            1,
+            WINDOW_SIZE,
+            1
+        ).astype(np.float32)
+
+        # Прогнозируем 24 часа.
+        scaled_prediction = model.predict(
+            X_input,
+            verbose=0
         )
-
-        history = df.loc[
-            history_start:available_end,
-            "actual_consumption",
-        ]
-
-        if len(history) != WINDOW_SIZE:
-            raise ValueError(
-                f"Expected {WINDOW_SIZE} input hours on "
-                f"{forecast_start}; found {len(history)}."
-            )
-
-        X = scaler.transform(
-            history.to_numpy().reshape(-1, 1)
-        ).flatten().reshape(1, WINDOW_SIZE, 1)
-
-        # Forecast the next 24 hours.
-        prediction_scaled = model.predict(
-            X, verbose=0
-        )[0]
 
         prediction = scaler.inverse_transform(
-            prediction_scaled.reshape(-1, 1)
+            scaled_prediction.reshape(-1, 1)
         ).flatten()
 
-        dates = pd.date_range(
-            forecast_start,
-            periods=FORECAST_HORIZON,
-            freq="h",
+        # Фактические значения используются только после прогноза.
+        actual_day = series.loc[
+            (series.index >= day_start)
+            & (series.index <= day_end)
+        ]
+
+        if len(actual_day) != FORECAST_HORIZON:
+            print(
+                f"Пропуск {day.date()}: "
+                f"получено {len(actual_day)} часов вместо 24."
+            )
+            continue
+
+        predictions.extend(prediction.tolist())
+        actual_values.extend(actual_day.to_numpy().tolist())
+        timestamps.extend(actual_day.index.tolist())
+
+        if day_number % 30 == 0 or day_number == len(test_days):
+            print(
+                f"Обработано дней: {day_number}/{len(test_days)}"
+            )
+
+    if not predictions:
+        raise ValueError(
+            "Прогнозы не получены. Проверь даты и доступный период данных."
         )
 
-        # Actual values are used only AFTER the prediction
-        # has been produced, for evaluation and future updates.
-        actual = df.loc[
-            dates, "actual_consumption"
-        ].to_numpy()
+    comparison = pd.DataFrame({
+        "datetime": timestamps,
+        "actual": actual_values,
+        "predicted": predictions
+    })
 
-        predictions.extend(prediction)
-        actual_values.extend(actual)
-        prediction_dates.extend(dates)
+    comparison = comparison.sort_values(
+        "datetime"
+    ).reset_index(drop=True)
 
-        print(
-            f"{forecast_start.date()} | "
-            f"training rows: {len(training_df):,} | "
-            f"forecast: {forecast_start.date()} - "
-            f"{forecast_end.date()}"
-        )
+    training_history = pd.DataFrame(history_rows)
 
-        # Move forward by one day.
-        # The next iteration will include newly observed actuals.
-        forecast_start += pd.Timedelta(days=1)
-
-    comparison = pd.DataFrame(
-        {
-            "actual_consumption": actual_values,
-            "cnn_prediction": predictions,
-        },
-        index=pd.DatetimeIndex(
-            prediction_dates, name="datetime"
-        ),
-    )
-
-    return model, scaler, comparison
+    return model, comparison, training_history
 
 
 # ============================================================
-# EVALUATION
+# METRICS
 # ============================================================
 
 def evaluate(comparison):
-    actual = comparison["actual_consumption"].to_numpy()
-    predicted = comparison["cnn_prediction"].to_numpy()
+    actual = comparison["actual"].to_numpy()
+    predicted = comparison["predicted"].to_numpy()
 
     mae = mean_absolute_error(actual, predicted)
-    rmse = np.sqrt(mean_squared_error(actual, predicted))
+
+    rmse = np.sqrt(
+        mean_squared_error(actual, predicted)
+    )
 
     nonzero = actual != 0
 
-    mape = (
-        np.mean(
+    if nonzero.any():
+        mape = np.mean(
             np.abs(
                 (actual[nonzero] - predicted[nonzero])
                 / actual[nonzero]
             )
         ) * 100
-        if nonzero.any()
-        else np.nan
-    )
+    else:
+        mape = np.nan
 
-    print("\nFINAL METRICS")
+    print("\n" + "=" * 50)
+    print("SLIDELEARN — TEST METRICS")
+    print("=" * 50)
+
     print(f"MAE:  {mae:.2f} MWh")
     print(f"RMSE: {rmse:.2f} MWh")
     print(f"MAPE: {mape:.2f}%")
+    print(f"Количество часов: {len(comparison):,}")
 
-    csv_path = os.path.join(
-        RESULTS_DIR, "rolling_test_comparison.csv"
+    return {
+        "MAE": mae,
+        "RMSE": rmse,
+        "MAPE": mape
+    }
+
+
+# ============================================================
+# PLOTS AND RESULTS
+# ============================================================
+
+def save_results(comparison, training_history, metrics):
+    # Таблица прогнозов.
+    comparison_path = os.path.join(
+        RESULTS_DIR,
+        "slidelearn_comparison.csv"
     )
 
     comparison.to_csv(
-        csv_path, encoding="utf-8-sig"
+        comparison_path,
+        index=False,
+        encoding="utf-8-sig"
     )
 
+    # Метрики в отдельный CSV.
+    metrics_path = os.path.join(
+        RESULTS_DIR,
+        "slidelearn_metrics.csv"
+    )
+
+    pd.DataFrame([metrics]).to_csv(
+        metrics_path,
+        index=False,
+        encoding="utf-8-sig"
+    )
+
+    # История обучения в CSV.
+    history_path = os.path.join(
+        RESULTS_DIR,
+        "slidelearn_training_history.csv"
+    )
+
+    training_history.to_csv(
+        history_path,
+        index=False,
+        encoding="utf-8-sig"
+    )
+
+    # График фактического и прогнозируемого потребления.
     fig, ax = plt.subplots(figsize=(15, 6))
 
     ax.plot(
-        comparison.index,
-        actual,
-        label="Actual consumption",
-        linewidth=1,
+        comparison["datetime"],
+        comparison["actual"],
+        label="Фактическое потребление",
+        linewidth=1
     )
 
     ax.plot(
-        comparison.index,
-        predicted,
-        label="Rolling CNN prediction",
-        linewidth=1,
+        comparison["datetime"],
+        comparison["predicted"],
+        label="Прогноз SlideLearn",
+        linewidth=1
     )
 
-    ax.set_title("Walk-forward CNN: actual vs predicted")
-    ax.set_xlabel("Date")
-    ax.set_ylabel("Consumption, MWh")
+    ax.set_title("SlideLearn: фактическое и прогнозируемое потребление")
+    ax.set_xlabel("Дата")
+    ax.set_ylabel("Потребление, МВт·ч")
     ax.legend()
-    ax.grid(True)
+    ax.grid(True, alpha=0.3)
 
     fig.tight_layout()
 
-    plot_path = os.path.join(
-        RESULTS_DIR, "rolling_test_predictions.png"
+    prediction_plot = os.path.join(
+        RESULTS_DIR,
+        "slidelearn_predictions.png"
     )
 
-    fig.savefig(plot_path, dpi=150)
+    fig.savefig(
+        prediction_plot,
+        dpi=150,
+        bbox_inches="tight"
+    )
+
     plt.close(fig)
 
-    print(f"\nCSV saved: {csv_path}")
-    print(f"Plot saved: {plot_path}")
+    # График истории обучения.
+    if not training_history.empty:
+        fig, axes = plt.subplots(
+            2,
+            1,
+            figsize=(12, 8),
+            sharex=True
+        )
+
+        epochs = np.arange(
+            1,
+            len(training_history) + 1
+        )
+
+        axes[0].plot(
+            epochs,
+            training_history["loss"],
+            label="Training MSE"
+        )
+
+        axes[0].set_title("История обучения: MSE")
+        axes[0].set_ylabel("MSE")
+        axes[0].legend()
+        axes[0].grid(True, alpha=0.3)
+
+        axes[1].plot(
+            epochs,
+            training_history["mae"],
+            label="Training MAE"
+        )
+
+        axes[1].set_title("История обучения: MAE")
+        axes[1].set_ylabel("MAE")
+        axes[1].set_xlabel("Эпоха начального обучения / шаг дообучения")
+        axes[1].legend()
+        axes[1].grid(True, alpha=0.3)
+
+        initial_count = int(
+            (training_history["stage"] == "initial").sum()
+        )
+
+        if initial_count < len(training_history):
+            for ax in axes:
+                ax.axvline(
+                    initial_count + 0.5,
+                    linestyle="--",
+                    alpha=0.7
+                )
+
+        fig.tight_layout()
+
+        history_plot = os.path.join(
+            RESULTS_DIR,
+            "slidelearn_training_history.png"
+        )
+
+        fig.savefig(
+            history_plot,
+            dpi=150,
+            bbox_inches="tight"
+        )
+
+        plt.close(fig)
+
+    print("\nФайлы сохранены:")
+    print(f"Прогнозы: {comparison_path}")
+    print(f"Метрики: {metrics_path}")
+    print(f"История обучения: {history_path}")
+    print(f"График прогнозов: {prediction_plot}")
 
 
 # ============================================================
@@ -484,17 +639,29 @@ def evaluate(comparison):
 # ============================================================
 
 def main():
-    df = load_data()
+    series = load_data()
 
-    model, scaler, comparison = rolling_training(df)
-
-    evaluate(comparison)
-
-    model.save(
-        os.path.join(MODEL_DIR, "rolling_cnn.keras")
+    model, comparison, training_history = rolling_training(
+        series
     )
 
-    print("\nRolling training completed.")
+    metrics = evaluate(comparison)
+
+    save_results(
+        comparison,
+        training_history,
+        metrics
+    )
+
+    model_path = os.path.join(
+        MODEL_DIR,
+        "slidelearn_cnn.keras"
+    )
+
+    model.save(model_path)
+
+    print(f"\nМодель сохранена: {model_path}")
+    print("SlideLearn завершил работу.")
 
 
 if __name__ == "__main__":
