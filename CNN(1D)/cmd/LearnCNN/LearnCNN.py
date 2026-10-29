@@ -21,7 +21,7 @@ from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 # ============================================================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_PATH = os.path.join(BASE_DIR, "..", "datasets", "electricity_71.csv")
+DATA_PATH = os.path.join(BASE_DIR, "../../..", "datasets", "electricity_75.csv")
 
 MODEL_DIR = os.path.join(BASE_DIR, "models")
 RESULTS_DIR = os.path.join(BASE_DIR, "results")
@@ -31,10 +31,10 @@ SCALER_PATH = os.path.join(MODEL_DIR, "scaler.pkl")
 
 # Historical data used for training
 TRAIN_START = "2022-01-01"
-TRAIN_END = "2023-12-31 23:00:00"
+TRAIN_END = "2024-12-31 23:00:00"
 
 # Data used for final evaluation
-TEST_START = "2024-01-01"
+TEST_START = "2025-01-01"
 TEST_END = "2025-12-31 23:00:00"
 
 # CNN parameters
