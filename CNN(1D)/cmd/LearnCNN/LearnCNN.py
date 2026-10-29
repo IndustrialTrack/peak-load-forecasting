@@ -21,7 +21,7 @@ from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 # ============================================================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_PATH = os.path.join(BASE_DIR, "..", "datasets", "electricity_71.csv")
+DATA_PATH = os.path.join(BASE_DIR, "../../..", "datasets", "electricity_75.csv")
 
 MODEL_DIR = os.path.join(BASE_DIR, "models")
 RESULTS_DIR = os.path.join(BASE_DIR, "results")
@@ -31,10 +31,10 @@ SCALER_PATH = os.path.join(MODEL_DIR, "scaler.pkl")
 
 # Historical data used for training
 TRAIN_START = "2022-01-01"
-TRAIN_END = "2023-12-31 23:00:00"
+TRAIN_END = "2024-12-31 23:00:00"
 
 # Data used for final evaluation
-TEST_START = "2024-01-01"
+TEST_START = "2025-01-01"
 TEST_END = "2025-12-31 23:00:00"
 
 # CNN parameters
@@ -666,27 +666,81 @@ def evaluate_model(model, scaler, df, test_df):
     }, index=prediction_index)
     comparison.index.name = "datetime"
 
-    def print_metrics(label, predicted, actual_values):
+    # Собираем метрики одновременно для консоли и TXT-файла.
+    metrics_lines = []
+
+    def calculate_metrics(label, predicted, actual_values):
+        predicted = np.asarray(predicted, dtype=float)
+        actual_values = np.asarray(actual_values, dtype=float)
+
+        valid = np.isfinite(predicted) & np.isfinite(actual_values)
+        predicted = predicted[valid]
+        actual_values = actual_values[valid]
+
+        if len(actual_values) == 0:
+            return None
+
         mae_value = mean_absolute_error(actual_values, predicted)
         rmse_value = np.sqrt(mean_squared_error(actual_values, predicted))
-        mape_value = np.mean(np.abs((actual_values - predicted) / actual_values)) * 100
-        print(f"{label}: MAE={mae_value:.2f} MWh, RMSE={rmse_value:.2f} MWh, MAPE={mape_value:.2f}%, условная точность={100 - mape_value:.2f}%")
+
+        # MAPE нельзя корректно вычислять для фактических нулевых значений.
+        nonzero = actual_values != 0
+        if nonzero.any():
+            mape_value = np.mean(
+                np.abs((actual_values[nonzero] - predicted[nonzero]) / actual_values[nonzero])
+            ) * 100
+        else:
+            mape_value = np.nan
+
+        metrics_lines.append(
+            f"{label}:\n"
+            f"  MAE:  {mae_value:.2f} MWh\n"
+            f"  RMSE: {rmse_value:.2f} MWh\n"
+            f"  MAPE: {mape_value:.2f}%\n"
+            f"  Количество часов: {len(actual_values):,}\n"
+        )
+
+        print(
+            f"{label}: MAE={mae_value:.2f} MWh, "
+            f"RMSE={rmse_value:.2f} MWh, "
+            f"MAPE={mape_value:.2f}%"
+        )
         return mae_value, rmse_value, mape_value
 
-    print_metrics("CNN 1D", predictions, actual)
+    print("\nFINAL METRICS — TEST PERIOD")
+    print("-" * 70)
+    metrics_lines.append("ИТОГОВЫЕ МЕТРИКИ — ТЕСТОВЫЙ ПЕРИОД\n")
+    metrics_lines.append("=" * 70 + "\n")
+    metrics_lines.append(f"Период теста: {prediction_index.min()} — {prediction_index.max()}\n")
+    metrics_lines.append(f"Размер окна: {WINDOW_SIZE} часов\n")
+    metrics_lines.append(f"Горизонт прогноза: {FORECAST_HORIZON} часов\n")
+    metrics_lines.append(f"Количество оценённых часов: {len(actual):,}\n\n")
+
+    calculate_metrics("CNN 1D", predictions, actual)
 
     if "planned_consumption" in evaluation_df.columns:
         planned = evaluation_df["planned_consumption"].reindex(prediction_index).to_numpy()
         comparison["planned_forecast"] = planned
         valid = np.isfinite(planned) & np.isfinite(actual) & (actual != 0)
         if valid.any():
-            print(f"Сравнение выполнено на {valid.sum():,} общих часах.")
-            print_metrics("Известный план (planned_consumption)", planned[valid], actual[valid])
-            print_metrics("CNN 1D на тех же часах", predictions[valid], actual[valid])
+            print(f"\nСравнение с планом выполнено на {valid.sum():,} общих часах.")
+            metrics_lines.append("\nСРАВНЕНИЕ С ПЛАНОВЫМ ПОТРЕБЛЕНИЕМ\n")
+            metrics_lines.append(f"Количество общих часов: {valid.sum():,}\n\n")
+            calculate_metrics("Известный план (planned_consumption)", planned[valid], actual[valid])
+            calculate_metrics("CNN 1D на тех же часах", predictions[valid], actual[valid])
         else:
-            print("В тестовом периоде нет валидных значений planned_consumption для сравнения.")
+            message = "В тестовом периоде нет валидных значений planned_consumption для сравнения."
+            print(message)
+            metrics_lines.append("\n" + message + "\n")
     else:
-        print("В CSV нет столбца planned_consumption; сравнение с известным прогнозом недоступно.")
+        message = "В CSV нет столбца planned_consumption; сравнение с планом недоступно."
+        print(message)
+        metrics_lines.append("\n" + message + "\n")
+
+    metrics_path = os.path.join(RESULTS_DIR, "test_metrics.txt")
+    with open(metrics_path, "w", encoding="utf-8") as file:
+        file.write("".join(metrics_lines))
+    print(f"\nИтоговые метрики сохранены в TXT: {metrics_path}")
 
     comparison_path = os.path.join(RESULTS_DIR, "test_comparison.csv")
     comparison.to_csv(comparison_path, encoding="utf-8-sig")
