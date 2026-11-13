@@ -1,7 +1,7 @@
 ## Команда
 1) Дивиченская А.А. ЕТ-243
 2) Пугач С.Е. ЕТ-243
-3) Никитин А.С. ЕТ-212 - LightGBM
+3) Никитин А.С. ЕТ-212 - [LightGBM](https://github.com/IndustrialTrack/peak-load-forecasting/blob/main/LightGBM/forecast_daily_2025/README.md)
 4) Вайнерт А.С. ЕТ-213
 5) 
 # Прогнозирование пиковых часов электропотребления энергосистемы на сутки вперед
