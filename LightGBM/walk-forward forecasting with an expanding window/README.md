@@ -50,11 +50,3 @@ def build_forecaster(name):
 - `peak_hours.csv` — фактические и предсказанные пиковые часы.
 - `electricity_75.csv` — исходные данные; `test_2025.csv` — сохранённый результат теста 2025 года.
 
-```bash
-python -m pip install -r requirements.txt
-python forecast.py
-```
-
-Python 3.12. Полный повторный расчёт занимает продолжительное время. Чтобы повторно рассчитать только 2026 год и использовать сохранённый тест 2025 года: `python forecast.py --start 2026-01-01`.
-
-Источник: репозиторий [peak-load-forecasting](https://github.com/IndustrialTrack/peak-load-forecasting).
