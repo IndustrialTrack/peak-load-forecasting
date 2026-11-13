@@ -30,7 +30,7 @@ MODEL_PATH = os.path.join(MODEL_DIR, "cnn_168.keras")
 SCALER_PATH = os.path.join(MODEL_DIR, "scaler.pkl")
 
 # Historical data used for training
-TRAIN_START = "2022-01-01"
+TRAIN_START = "2021-01-01"
 TRAIN_END = "2024-12-31 23:00:00"
 
 # Data used for final evaluation
@@ -749,8 +749,6 @@ def evaluate_model(model, scaler, df, test_df):
     fig, ax = plt.subplots(figsize=(14, 6))
     ax.plot(prediction_index, actual, label="Фактическое потребление", linewidth=1)
     ax.plot(prediction_index, predictions, label="CNN 1D", linewidth=1)
-    if "planned_forecast" in comparison:
-        ax.plot(prediction_index, comparison["planned_forecast"], label="Известный план", linewidth=1, alpha=0.8)
     ax.set_title("Actual vs predicted consumption on test data")
     ax.set_xlabel("Time")
     ax.set_ylabel("Consumption, MWh")

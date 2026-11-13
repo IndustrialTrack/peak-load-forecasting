@@ -26,7 +26,7 @@ PROJECT_DIR = os.path.abspath(os.path.join(CNN_DIR, ".."))
 
 DATA_PATH = os.path.join(PROJECT_DIR, "datasets", "electricity_75.csv")
 MODEL_DIR = os.path.join(SCRIPT_DIR, "models")
-RESULTS_DIR = os.path.join(SCRIPT_DIR, "results")
+RESULTS_DIR = os.path.join(CNN_DIR, "resultOneDayLearn")
 
 MODEL_PATH = os.path.join(MODEL_DIR, "cnn_168.keras")
 SCALER_PATH = os.path.join(MODEL_DIR, "scaler.pkl")
@@ -214,6 +214,110 @@ def print_top_3_peaks(forecast):
 
 
 # ============================================================
+# METRICS FOR A SPECIFIC DAY
+# ============================================================
+
+def save_daily_metrics(forecast, df, target_date):
+    """
+    Compare the forecast with actual values for the same day.
+
+    Top-3 Hit rate = number of shared actual/predicted top-3 hours / 3.
+    F1-macro = mean F1 for peak (top 3) and non-peak hours.
+    """
+    target_start = pd.Timestamp(target_date).normalize()
+    actual_index = pd.date_range(target_start, periods=24, freq="h")
+
+    actual_day = df["actual_consumption"].reindex(actual_index)
+    predicted = forecast.set_index("datetime")[
+        "predicted_consumption"
+    ].reindex(actual_index)
+
+    metrics_path = os.path.join(
+        RESULTS_DIR, f"metrics_{target_start:%Y-%m-%d}.txt"
+    )
+
+    valid = (
+        actual_day.notna()
+        & predicted.notna()
+        & np.isfinite(actual_day.to_numpy(dtype=float))
+        & np.isfinite(predicted.to_numpy(dtype=float))
+    )
+
+    lines = [
+        "FINAL METRICS\n",
+        f"Date: {target_start:%Y-%m-%d}\n",
+        f"Actual hours available: {int(valid.sum())}/24\n",
+    ]
+
+    # Do not report full-day metrics from an incomplete actual day.
+    if int(valid.sum()) != 24:
+        lines.extend([
+            "\nMetrics not calculated: 24 actual hourly values are required.\n",
+            "Top-3 Hit rate and F1-macro also require all 24 actual values.\n",
+        ])
+        with open(metrics_path, "w", encoding="utf-8") as file:
+            file.writelines(lines)
+        print("\n" + "".join(lines))
+        print(f"Metrics status saved to: {metrics_path}")
+        return
+
+    actual_values = actual_day.to_numpy(dtype=float)
+    predicted_values = predicted.to_numpy(dtype=float)
+
+    mae = float(np.mean(np.abs(actual_values - predicted_values)))
+    rmse = float(np.sqrt(np.mean((actual_values - predicted_values) ** 2)))
+
+    nonzero = actual_values != 0
+    mape = (
+        float(np.mean(np.abs(
+            (actual_values[nonzero] - predicted_values[nonzero])
+            / actual_values[nonzero]
+        )) * 100)
+        if nonzero.any() else float("nan")
+    )
+
+    # The three hours with highest actual/predicted consumption.
+    actual_top3 = set(np.argsort(actual_values)[-3:].tolist())
+    predicted_top3 = set(np.argsort(predicted_values)[-3:].tolist())
+    hits = len(actual_top3 & predicted_top3)
+    top3_hit_rate = hits / 3.0
+
+    # Binary labels: 1 = one of the top-3 peak hours, 0 = other hours.
+    y_true = np.zeros(24, dtype=int)
+    y_pred = np.zeros(24, dtype=int)
+    y_true[list(actual_top3)] = 1
+    y_pred[list(predicted_top3)] = 1
+
+    def f1_for_class(true_labels, predicted_labels, label):
+        tp = int(np.sum((true_labels == label) & (predicted_labels == label)))
+        fp = int(np.sum((true_labels != label) & (predicted_labels == label)))
+        fn = int(np.sum((true_labels == label) & (predicted_labels != label)))
+        denominator = 2 * tp + fp + fn
+        return 0.0 if denominator == 0 else 2 * tp / denominator
+
+    f1_peak = f1_for_class(y_true, y_pred, 1)
+    f1_nonpeak = f1_for_class(y_true, y_pred, 0)
+    f1_macro = (f1_peak + f1_nonpeak) / 2.0
+
+    lines.extend([
+        f"MAE:  {mae:.2f} MWh\n",
+        f"RMSE: {rmse:.2f} MWh\n",
+        f"MAPE: {mape:.2f}%\n",
+        f"Top-3 Hit rate: {top3_hit_rate:.2%} ({hits}/3 actual peak hours found)\n",
+        f"F1-macro: {f1_macro:.4f}\n",
+        "\nDefinitions:\n",
+        "Top-3 Hit rate = overlap between actual and predicted top-3 hours / 3.\n",
+        "F1-macro = mean F1 for peak hours (top 3) and non-peak hours.\n",
+    ])
+
+    with open(metrics_path, "w", encoding="utf-8") as file:
+        file.writelines(lines)
+
+    print("\n" + "".join(lines))
+    print(f"Daily metrics saved to: {metrics_path}")
+
+
+# ============================================================
 # PLOT ACTUAL AND PREDICTED VALUES
 # ============================================================
 
@@ -247,8 +351,8 @@ def plot_day(forecast, df, target_date):
             transform=axes[0].transAxes
         )
 
-    axes[0].set_title(f"Actual electricity consumption — {target_start:%Y-%m-%d}")
-    axes[0].set_ylabel("Consumption, MWh")
+    axes[0].set_title(f"Актуальное потребление на: {target_start:%Y-%m-%d}")
+    axes[0].set_ylabel("Актуальное потребление, МВт*ч")
     axes[0].set_xticks(hours)
     axes[0].set_xlim(-0.5, 23.5)
     axes[0].grid(True)
@@ -259,9 +363,9 @@ def plot_day(forecast, df, target_date):
         forecast["predicted_consumption"].to_numpy(),
         marker="o"
     )
-    axes[1].set_title(f"CNN 1D predicted electricity consumption — {target_start:%Y-%m-%d}")
-    axes[1].set_xlabel("Hour of day")
-    axes[1].set_ylabel("Predicted consumption, MWh")
+    axes[1].set_title(f"CNN 1D Прогнозирование на: {target_start:%Y-%m-%d}")
+    axes[1].set_xlabel("Часы")
+    axes[1].set_ylabel("прогнозируемое потребление, МВт*ч")
     axes[1].set_xticks(hours)
     axes[1].set_xlim(-0.5, 23.5)
     axes[1].grid(True)
@@ -319,6 +423,7 @@ def main():
     )
 
     print_top_3_peaks(forecast)
+    save_daily_metrics(forecast, df, args.date)
     plot_day(forecast, df, args.date)
 
 

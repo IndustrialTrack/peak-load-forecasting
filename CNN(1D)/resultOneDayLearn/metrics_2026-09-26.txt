@@ -1,0 +1,12 @@
+FINAL METRICS
+Date: 2026-09-26
+Actual hours available: 24/24
+MAE:  41.90 MWh
+RMSE: 52.51 MWh
+MAPE: 1.07%
+Top-3 Hit rate: 0.00% (0/3 actual peak hours found)
+F1-macro: 0.4286
+
+Definitions:
+Top-3 Hit rate = overlap between actual and predicted top-3 hours / 3.
+F1-macro = mean F1 for peak hours (top 3) and non-peak hours.
