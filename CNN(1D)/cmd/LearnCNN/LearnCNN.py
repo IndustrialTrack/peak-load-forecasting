@@ -30,12 +30,12 @@ MODEL_PATH = os.path.join(MODEL_DIR, "cnn_168.keras")
 SCALER_PATH = os.path.join(MODEL_DIR, "scaler.pkl")
 
 # Historical data used for training
-TRAIN_START = "2021-01-01"
-TRAIN_END = "2024-12-31 23:00:00"
+TRAIN_START = "2022-01-01"
+TRAIN_END = "2025-12-31 23:00:00"
 
 # Data used for final evaluation
-TEST_START = "2025-01-01"
-TEST_END = "2025-12-31 23:00:00"
+TEST_START = "2026-01-01"
+TEST_END = "2026-12-31 23:00:00"
 
 # CNN parameters
 WINDOW_SIZE = 168       # 7 days
@@ -45,7 +45,6 @@ EPOCHS = 50
 BATCH_SIZE = 32
 
 RANDOM_SEED = 42
-
 
 # ============================================================
 # REPRODUCIBILITY
