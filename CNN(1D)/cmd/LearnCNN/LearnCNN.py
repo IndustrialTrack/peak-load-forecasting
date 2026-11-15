@@ -30,7 +30,7 @@ MODEL_PATH = os.path.join(MODEL_DIR, "cnn_168.keras")
 SCALER_PATH = os.path.join(MODEL_DIR, "scaler.pkl")
 
 # Historical data used for training
-TRAIN_START = "2022-01-01"
+TRAIN_START = "2021-01-01"
 TRAIN_END = "2025-12-31 23:00:00"
 
 # Data used for final evaluation
