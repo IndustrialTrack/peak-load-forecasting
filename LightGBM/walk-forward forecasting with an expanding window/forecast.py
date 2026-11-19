@@ -1,4 +1,3 @@
-import argparse
 from pathlib import Path
 
 import holidays
@@ -14,6 +13,10 @@ from mlforecast.lag_transforms import RollingMean, RollingStd
 ROOT = Path(__file__).resolve().parent
 
 REGION = "Челябинская область"
+TRAIN_START = pd.Timestamp("2022-01-01")
+FORECAST_START = pd.Timestamp("2026-01-01")
+FORECAST_STOP = pd.Timestamp("2027-01-01")
+ONE_DAY = pd.Timedelta(days=1)
 
 EXOG = ["is_weekend", "is_holiday", "is_day_off", "is_pre_holiday",
         "is_post_holiday", "days_to_holiday", "days_from_holiday",
@@ -95,7 +98,8 @@ def load_data():
     raw["observed"] = numeric(raw.actual_consumption)
     if raw.ds.duplicated().any():
         raise ValueError("В данных есть дубликаты дат и часов")
-    raw = raw.set_index("ds").reindex(pd.date_range("2022-01-01", "2026-12-31 23:00", freq="h"))
+    hours = pd.date_range(TRAIN_START, FORECAST_STOP, freq="h", inclusive="left")
+    raw = raw.set_index("ds").reindex(hours)
     raw.index.name = "ds"
     data = raw.reset_index()
     data["observed"] = data.observed.where(data.observed.gt(0))
@@ -104,14 +108,22 @@ def load_data():
     return data
 
 
-def forecast_day(data, day, years):
-    data = add_calendar(data, years)
-    train = data.loc[data.ds.lt(day), ["unique_id", "ds", "y"] + EXOG]
-    future = data.loc[data.ds.ge(day) & data.ds.lt(day + pd.Timedelta(days=1))]
+def forecast_period(data, start, stop, mode):
+    train = data.loc[data.ds.lt(start), ["unique_id", "ds", "y"] + EXOG]
+    future = data.loc[data.ds.ge(start) & data.ds.lt(stop)]
     model = build_forecaster("extended_400")
     model.fit(train, static_features=[])
-    predictions = model.predict(24, X_df=future[["unique_id", "ds"] + EXOG])
-    return predictions.forecast.to_numpy()
+    predictions = model.predict(len(future), X_df=future[["unique_id", "ds"] + EXOG])
+
+    actual = future[["ds", "observed"]].rename(columns={"observed": "y"})
+    output = actual.merge(
+        predictions[["ds", "forecast"]].rename(columns={"forecast": "y_pred"}),
+        on="ds", how="left", validate="one_to_one",
+    )
+    if output.y_pred.isna().any():
+        raise ValueError(f"Получен неполный прогноз с {start} до {stop}")
+    output["mode"] = mode
+    return output
 
 
 def peak_results(frame):
@@ -125,75 +137,78 @@ def peak_results(frame):
         values.append({"date": day, "actual": " | ".join(a.ds.dt.strftime("%H:%M")),
                        "predicted": " | ".join(b.ds.dt.strftime("%H:%M")), "hits": overlap,
                        "MAE": abs(a.y - a.y_pred).mean()})
-    return pd.DataFrame(values)
+    return pd.DataFrame(values, columns=["date", "actual", "predicted", "hits", "MAE"])
+
+
+def save_forecast_plot(output, last_actual):
+    fig, ax = plt.subplots(figsize=(16, 5))
+    ax.plot(output.ds, output.y, label="Факт", linewidth=0.8)
+    ax.plot(output.ds, output.y_pred, label="Прогноз", linewidth=0.8)
+    ax.axvline(last_actual, color="darkred", linestyle="--", label="Последний доступный факт")
+    ax.set(title=f"{REGION}: факт и прогноз за 2026 год", xlabel="Дата", ylabel="МВт·ч")
+    ax.grid(alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(ROOT / "forecast.png", dpi=140)
+    plt.close(fig)
+
+
+def save_errors_plot(observed):
+    daily = pd.DataFrame([
+        {"date": day, **metrics(g.y, g.y_pred)}
+        for day, g in observed.groupby(observed.ds.dt.normalize())
+    ])
+    labels = {
+        "MAE": "MAE, МВт·ч",
+        "RMSE": "RMSE, МВт·ч",
+        "WAPE_pct": "WAPE, %",
+        "MAPE_pct": "MAPE, %",
+    }
+    fig, axes = plt.subplots(2, 2, figsize=(15, 7), sharex=True, layout="constrained")
+    for ax, (column, label) in zip(axes.flat, labels.items()):
+        ax.plot(daily.date, daily[column], color="steelblue", linewidth=1)
+        ax.set_ylabel(label)
+        ax.grid(alpha=0.3)
+    fig.suptitle(f"Ошибки почасового прогноза по дням — {REGION}")
+    fig.supxlabel("Дата")
+    fig.savefig(ROOT / "errors.png", dpi=140)
+    plt.close(fig)
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--start", default="2025-01-01", choices=["2025-01-01", "2026-01-01"])
-    args = parser.parse_args()
-    data = load_data()
+    data = add_calendar(load_data(), range(TRAIN_START.year, FORECAST_STOP.year))
     last_actual = data.loc[data.observed.notna(), "ds"].max()
-    last_day = last_actual.normalize()
-    if last_actual.hour != 23:
-        raise ValueError("Последний день с фактом должен быть полным")
+    if pd.isna(last_actual) or last_actual < FORECAST_START:
+        raise ValueError("В исходных данных нет фактических наблюдений за 2026 год")
+
+    days = pd.date_range(FORECAST_START, last_actual.normalize(), freq="D")
     result = []
-    start = pd.Timestamp(args.start)
-    for i, day in enumerate(pd.date_range(start, last_day), 1):
-        years = [2022, 2023, 2024, 2025] if day.year == 2025 else [2022, 2023, 2024, 2025, 2026]
-        current = data.loc[data.ds.lt(day + pd.Timedelta(days=1))].copy()
-        pred = forecast_day(current, day, years)
-        test = data.loc[data.ds.ge(day) & data.ds.lt(day + pd.Timedelta(days=1)), ["ds", "observed"]].copy()
-        test.columns = ["ds", "y"]
-        test["y_pred"] = pred
-        test["mode"] = "test_2025" if day.year == 2025 else "forecast_with_actual_2026"
-        result.append(test)
-        if i == 1 or i % 10 == 0:
-            pd.concat(result).to_csv(ROOT / "progress.csv", index=False)
-            print(day.date(), i, flush=True)
-    frame = add_calendar(data, [2022, 2023, 2024, 2025, 2026])
-    train = frame.loc[frame.ds.le(last_actual), ["unique_id", "ds", "y"] + EXOG]
-    future = frame.loc[frame.ds.gt(last_actual)]
-    model = build_forecaster("extended_400")
-    model.fit(train, static_features=[])
-    forecast = model.predict(len(future), X_df=future[["unique_id", "ds"] + EXOG])
-    tail = future[["ds", "observed"]].copy()
-    tail.columns = ["ds", "y"]
-    tail["y_pred"] = forecast.forecast.to_numpy()
-    tail["mode"] = "recursive_without_actual_2026"
-    result.append(tail)
+    for i, day in enumerate(days, 1):
+        result.append(forecast_period(data, day, day + ONE_DAY, "forecast_with_actual_2026"))
+        if i == 1 or i % 20 == 0 or i == len(days):
+            print(f"[{i}/{len(days)}] Прогноз за {day.date()} готов", flush=True)
+
+    recursive_start = days[-1] + ONE_DAY
+    if recursive_start < FORECAST_STOP:
+        print(f"Рекурсивный прогноз с {recursive_start.date()} до конца года", flush=True)
+        result.append(forecast_period(data, recursive_start, FORECAST_STOP, "recursive_without_actual_2026"))
+
     output = pd.concat(result, ignore_index=True)
-    if args.start == "2026-01-01":
-        existing = pd.read_csv(ROOT / "test_2025.csv", parse_dates=["ds"])
-        output = pd.concat([existing, output], ignore_index=True)
-    output.to_csv(ROOT / "forecast_2025_2026.csv", index=False)
-    observed = output.loc[output.y.notna()].copy()
-    rows = []
-    peaks = []
-    for year, g in observed.groupby(observed.ds.dt.year):
-        rows.append({"year": year, **metrics(g.y, g.y_pred)})
-        pk = peak_results(g)
-        pk["year"] = year
-        peaks.append(pk)
-    pd.DataFrame(rows).to_csv(ROOT / "metrics.csv", index=False)
-    pd.concat(peaks).to_csv(ROOT / "peak_hours.csv", index=False)
-    fig, ax = plt.subplots(figsize=(16, 5))
-    for label, col in [("Факт", "y"), ("Прогноз", "y_pred")]:
-        ax.plot(output.ds, output[col], label=label, linewidth=0.7)
-    ax.axvline(last_actual, color="red", linestyle="--", label="Последний доступный факт")
-    ax.set(title="Челябинская область: факт и прогноз", ylabel="МВт·ч")
-    ax.grid(alpha=.3); ax.legend(); fig.tight_layout(); fig.savefig(ROOT / "forecast.png", dpi=140); plt.close(fig)
-    daily = []
-    for day, g in observed.groupby(observed.ds.dt.normalize()):
-        daily.append({"date": day, **metrics(g.y, g.y_pred)})
-    daily = pd.DataFrame(daily)
-    daily.to_csv(ROOT / "daily_metrics.csv", index=False)
-    for column in ["MAE", "RMSE", "WAPE_pct", "MAPE_pct"]:
-        fig, ax = plt.subplots(figsize=(14, 4))
-        ax.plot(daily.date, daily[column], linewidth=.8)
-        ax.set(title=f"{column} по дням", xlabel="Дата", ylabel=column)
-        ax.grid(alpha=.3); fig.tight_layout(); fig.savefig(ROOT / f"{column}.png", dpi=140); plt.close(fig)
-    print(pd.DataFrame(rows).to_string(index=False), flush=True)
+    observed = output.loc[output.y.notna()]
+    peaks = peak_results(observed)
+    summary = pd.DataFrame([{
+        "year": FORECAST_START.year,
+        **metrics(observed.y, observed.y_pred),
+        "complete_days": len(peaks),
+        "peak_MAE": peaks.MAE.mean(),
+        "peak_top3_hit_pct": peaks.hits.mean() / 3 * 100,
+    }])
+
+    output.to_csv(ROOT / "forecast_2026.csv", index=False)
+    summary.to_csv(ROOT / "metrics.csv", index=False)
+    save_forecast_plot(output, last_actual)
+    save_errors_plot(observed)
+    print(summary.to_string(index=False), flush=True)
 
 
 if __name__ == "__main__":
