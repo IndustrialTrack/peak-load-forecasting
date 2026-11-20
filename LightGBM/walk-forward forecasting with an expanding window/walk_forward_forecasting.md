@@ -151,7 +151,7 @@ MLForecast формирует почасовые признаки и перед�
 - Скрипт запускается из папки командой `python forecast.py`.
 - Для годового прогноза и сравнения с сохранённым суточным расчётом используется команда `python forecast.py --year-ahead`.
 - Почасовой факт, прогноз и режим расчёта за 2026 год. [`forecast_2026.csv`](forecast_2026.csv)
-- Почасовой прогноз на весь 2026 год после одного обучения. [`forecast_2026_year_ahead.csv`](forecast_2026_year_ahead.csv)
+- Почасовой прогноз на весь 2026 год после одного обучения. [`forecast_2026_year_ahead.csv`](../forecast_2026_year_ahead.csv)
 - Сравнение режимов по попаданиям в пики и почасовым ошибкам на общем периоде. [`comparison_2026.csv`](comparison_2026.csv)
 - График сравнения прогноза и факта. [`forecast.png`](forecast.png)
 - Графики MAE, RMSE, WAPE и MAPE по дням с фактом. [`errors.png`](errors.png)

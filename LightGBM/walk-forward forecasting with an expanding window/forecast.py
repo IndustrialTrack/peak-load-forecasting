@@ -187,7 +187,7 @@ def run_year_ahead():
     print("Однократное обучение на данных по 2025 год и прогноз на весь 2026 год", flush=True)
     output = forecast_period(data, FORECAST_START, FORECAST_STOP, "year_ahead_2026")
     comparison = compare_annual_forecasts(output, walk_forward)
-    output.to_csv(ROOT / "forecast_2026_year_ahead.csv", index=False)
+    output.to_csv(ROOT.parent / "forecast_2026_year_ahead.csv", index=False)
     comparison.to_csv(ROOT / "comparison_2026.csv", index=False)
     print(comparison.to_string(index=False), flush=True)
 
