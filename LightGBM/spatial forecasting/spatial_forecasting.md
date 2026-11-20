@@ -87,4 +87,4 @@
 - Скрипт запускается командой `python spatial_forecast.py` с зависимостями первой задачи.
 - Почасовой файл содержит фактическое потребление Челябинской области и оба прогноза. [Прогнозы](forecast_2026.csv)
 - Метрики первой и второй задач рассчитаны за общий период. [Сравнение](comparison.csv)
-- Метрики остальных регионов из предыдущего эксперимента с ежемесячным переобучением доступны отдельно. [CSV с метриками по регионам](https://github.com/IndustrialTrack/peak-load-forecasting/blob/28a31493c29086a8b2dd8d0a7c2f48eec06e6b71/LightGBM/spatial%20forecasting/comparison.csv)
+- Метрики остальных регионов из предыдущего эксперимента с ежемесячным переобучением доступны отдельно. [CSV с метриками по регионам](https://github.com/IndustrialTrack/peak-load-forecasting/blob/c5d3458399e94e9343d704c114b4457084c4a5d5/LightGBM/spatial%20forecasting/comparison.csv)

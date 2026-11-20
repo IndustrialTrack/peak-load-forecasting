@@ -1,3 +1,4 @@
+import argparse
 from pathlib import Path
 
 import holidays
@@ -148,6 +149,49 @@ def peak_results(frame):
     return pd.DataFrame(values, columns=["date", "actual", "predicted", "hits", "MAE"])
 
 
+def compare_annual_forecasts(year_ahead, walk_forward):
+    paired = year_ahead.merge(
+        walk_forward[["ds", "y_pred"]].rename(columns={"y_pred": "walk_forward_pred"}),
+        on="ds", how="left", validate="one_to_one",
+    )
+    observed = paired.loc[paired.y.notna()]
+    if not np.isfinite(observed[["y_pred", "walk_forward_pred"]]).all().all():
+        raise ValueError("Для сравнения нужны оба прогноза за все часы с фактом")
+
+    rows = []
+    for method, prediction in (
+        ("Одно обучение на год", "y_pred"),
+        ("Суточное переобучение", "walk_forward_pred"),
+    ):
+        scored = observed[["ds", "y"]].assign(y_pred=observed[prediction])
+        peaks = peak_results(scored)
+        rows.append({
+            "method": method,
+            "complete_days": len(peaks),
+            "peak_hours": 3 * len(peaks),
+            "peak_matches": int(peaks.hits.sum()),
+            "peak_top3_hit_pct": peaks.hits.mean() / 3 * 100,
+            "full_peak_days": int(peaks.hits.eq(3).sum()),
+            "missed_peak_days": int(peaks.hits.eq(0).sum()),
+            "peak_MAE": peaks.MAE.mean(),
+            **metrics(scored.y, scored.y_pred),
+        })
+    return pd.DataFrame(rows)
+
+
+def run_year_ahead():
+    walk_forward = pd.read_csv(
+        ROOT / "forecast_2026.csv", usecols=["ds", "y_pred"], parse_dates=["ds"],
+    )
+    data = add_calendar(load_data(), range(TRAIN_START.year, FORECAST_STOP.year))
+    print("Однократное обучение на данных по 2025 год и прогноз на весь 2026 год", flush=True)
+    output = forecast_period(data, FORECAST_START, FORECAST_STOP, "year_ahead_2026")
+    comparison = compare_annual_forecasts(output, walk_forward)
+    output.to_csv(ROOT / "forecast_2026_year_ahead.csv", index=False)
+    comparison.to_csv(ROOT / "comparison_2026.csv", index=False)
+    print(comparison.to_string(index=False), flush=True)
+
+
 def save_forecast_plot(output, last_actual):
     fig, ax = plt.subplots(figsize=(16, 5))
     ax.plot(output.ds, output.y, label="Факт", linewidth=0.8)
@@ -222,4 +266,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Прогноз потребления Челябинской области")
+    parser.add_argument(
+        "--year-ahead", action="store_true",
+        help="однократное обучение, прогноз на весь год и сравнение с сохранённым суточным прогнозом",
+    )
+    if parser.parse_args().year_ahead:
+        run_year_ahead()
+    else:
+        main()
