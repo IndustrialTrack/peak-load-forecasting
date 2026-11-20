@@ -11,6 +11,7 @@ from mlforecast import MLForecast
 from mlforecast.lag_transforms import RollingMean, RollingStd
 
 ROOT = Path(__file__).resolve().parent
+DATASETS = ROOT.parents[1] / "datasets"
 
 REGION = "Челябинская область"
 TRAIN_START = pd.Timestamp("2022-01-01")
@@ -91,20 +92,27 @@ def metrics(y, pred):
             "WAPE_pct": float(err.sum() / np.abs(y).sum() * 100) if np.abs(y).sum() else np.nan,
             "MAPE_pct": float(np.mean(err[nonzero] / np.abs(y[nonzero])) * 100) if nonzero.any() else np.nan}
 
-def load_data():
-    raw = pd.read_csv(ROOT / "electricity_75.csv")
-    raw = raw.loc[raw.region_name.eq(REGION)].copy()
+def load_data(path=DATASETS / "electricity_75.csv", region=REGION, stop=FORECAST_STOP):
+    try:
+        raw = pd.read_csv(path, encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        raw = pd.read_csv(path, encoding="cp1251")
+
+    raw = raw.loc[raw.region_name.eq(region), ["date", "hour", "actual_consumption"]].copy()
+    if raw.empty:
+        raise ValueError(f"В {path} нет данных для региона «{region}»")
+
     raw["ds"] = pd.to_datetime(raw.date) + pd.to_timedelta(raw.hour, unit="h")
     raw["observed"] = numeric(raw.actual_consumption)
-    if raw.ds.duplicated().any():
-        raise ValueError("В данных есть дубликаты дат и часов")
-    hours = pd.date_range(TRAIN_START, FORECAST_STOP, freq="h", inclusive="left")
-    raw = raw.set_index("ds").reindex(hours)
-    raw.index.name = "ds"
-    data = raw.reset_index()
-    data["observed"] = data.observed.where(data.observed.gt(0))
+    raw["observed"] = raw.observed.where(raw.observed.gt(0))
+    observed_by_hour = raw.groupby("ds")["observed"]
+    if observed_by_hour.nunique().gt(1).any():
+        raise ValueError(f"В {path} есть разные факты за один и тот же час")
+
+    hours = pd.date_range(TRAIN_START, stop, freq="h", inclusive="left", name="ds")
+    data = observed_by_hour.first().reindex(hours).reset_index()
     data["y"] = data.observed.ffill()
-    data["unique_id"] = REGION
+    data["unique_id"] = region
     return data
 
 
@@ -191,7 +199,9 @@ def main():
     recursive_start = days[-1] + ONE_DAY
     if recursive_start < FORECAST_STOP:
         print(f"Рекурсивный прогноз с {recursive_start.date()} до конца года", flush=True)
-        result.append(forecast_period(data, recursive_start, FORECAST_STOP, "recursive_without_actual_2026"))
+        after_last_actual = last_actual + pd.Timedelta(hours=1)
+        recursive = forecast_period(data, after_last_actual, FORECAST_STOP, "recursive_without_actual_2026")
+        result.append(recursive.loc[recursive.ds.ge(recursive_start)])
 
     output = pd.concat(result, ignore_index=True)
     observed = output.loc[output.y.notna()]
