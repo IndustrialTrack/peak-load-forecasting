@@ -16,4 +16,3 @@ LightGBM однократно обучается на почасовом пот�
 
 [Сравнение с локальным прогнозом первой задачи](spatial%20forecasting/spatial_forecasting.md)
 
-### 3.
