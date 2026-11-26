@@ -1,9 +1,4 @@
 """
-Прогнозирование пиковых часов электропотребления — модель Prophet
-(или эквивалентный Fourier-GAM, если пакет `prophet` не установлен).
-
-Проект: ООО «ТЕРА» / СО ЕЭС.
-
 Содержимое модуля:
   1. загрузка CSV региона и кэш очищенного датасета
   2. очистка и валидация почасового ряда
@@ -14,16 +9,16 @@
   7. бэктесты: rolling-origin и расширяющееся окно (переобучение каждый день)
   8. таблицы результатов
   9. графики
+ 10. единый протокол оценки Prophet: честный/текущий вариант, пространственный регрессор соседей,
+     метрики «пикового режима», парная статистика (задачи 1-2)
 
-Если `prophet` установлен, он подхватывается автоматически (интерфейс
-_FourierGAM повторяет нужную часть интерфейса Prophet) — менять код не нужно.
-Какой движок работает, показывает флаг _HAS_REAL_PROPHET. Fourier-GAM —
-математический аналог Prophet (линейный тренд + Fourier-сезонности +
-праздники + регрессор + интервал по остаткам); числа с ним НЕ равны числам
-настоящего Prophet, для отчётов используй настоящий.
 """
 
+import glob
+import itertools
+import json
 import logging
+import math
 import os
 import re
 import time
@@ -34,7 +29,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed, effective_n_jobs
-from scipy.stats import norm
+from scipy.stats import norm, wilcoxon
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
@@ -42,6 +37,8 @@ warnings.filterwarnings("ignore")
 # cmdstanpy на каждый fit пишет по несколько INFO-строк; на 365 переобучениях
 # они забивают консоль и прячут строки прогресса.
 logging.getLogger("cmdstanpy").setLevel(logging.WARNING)
+logging.getLogger("prophet").setLevel(logging.WARNING)
+H1 = pd.Timedelta(hours=1)
 
 
 # =============================================================================
@@ -417,6 +414,23 @@ def train_prophet(df: pd.DataFrame, target_col: str = "actual_consumption",
     return model
 
 
+def apply_price_mode(df: pd.DataFrame, mode: str = "lag24") -> pd.DataFrame:
+    """
+    Как цена попадает в модель как регрессор.
+      'lag24' — цена тех же суток назад (известна в 00:00 суток прогноза) — КОРРЕКТНО, по умолчанию;
+      'now'   — цена в тот же час, что и прогноз. В момент прогноза её нет => утечка будущего
+                (так работал прежний main.py; оставлено только для сравнения).
+    Сдвиг делается по ВСЕЙ истории до нарезки на train/test, поэтому границы фолдов не искажаются.
+    """
+    if mode == "lag24" and "average_price" in df.columns:
+        df = df.copy()
+        df["average_price"] = df["average_price"].shift(24).bfill()
+    elif mode not in ("lag24", "now"):
+        raise ValueError("price_mode: 'lag24' или 'now'")
+    return df
+
+
+
 def forecast_horizon(model, timestamps: pd.DatetimeIndex, price_series: pd.Series | None = None):
     """Прогноз на заданные часы -> DataFrame[yhat, yhat_lower, yhat_upper] с индексом ds."""
     future = pd.DataFrame({"ds": timestamps})
@@ -504,8 +518,9 @@ COMPARISON_CRITERIA = ["MAE", "RMSE", "MAPE_%", "sMAPE_%", "R2",
 # 7. БЭКТЕСТЫ
 # =============================================================================
 def rolling_backtest(df: pd.DataFrame, n_folds: int = 5, horizon_days: int = 1,
-                      step_days: int = 14, **model_kwargs) -> pd.DataFrame:
+                      step_days: int = 14, price_mode: str = "lag24", **model_kwargs) -> pd.DataFrame:
     """Прогоняет evaluate_fold по нескольким walk-forward фолдам и собирает метрики в таблицу."""
+    df = apply_price_mode(df, price_mode)
     folds = rolling_origin_folds(df, n_folds=n_folds, horizon_days=horizon_days, step_days=step_days)
     rows = []
     for i, (train_df, test_df) in enumerate(folds, 1):
@@ -569,6 +584,7 @@ def expanding_window_daily_backtest(df: pd.DataFrame, forecast_dates,
                                      hourly_csv: str | None = None,
                                      n_jobs: int = 1,
                                      resume: bool = False,
+                                     price_mode: str = "lag24",
                                      **model_kwargs) -> pd.DataFrame:
     """
     "Расширяющееся окно" (expanding window), день за днём — так, как это нужно
@@ -597,10 +613,13 @@ def expanding_window_daily_backtest(df: pd.DataFrame, forecast_dates,
                      менялась модель/параметры — поставь False (или удали файлы),
                      иначе старые дни останутся от прошлой версии.
     progress_every — печатать строку прогресса примерно раз в N дней.
+    price_mode     — 'lag24' (по умолчанию): регрессор цены = цена сутки назад, известна на момент прогноза.
+                     'now': цена того же часа (прежнее поведение, УТЕЧКА будущего — только для сравнения).
 
     Возвращает DataFrame с метриками по каждому дню + итоговую строку
     "СРЕДНЕЕ" — готовую таблицу для сравнения с другими моделями проекта.
     """
+    df = apply_price_mode(df, price_mode)
     dates = pd.DatetimeIndex(pd.to_datetime(list(forecast_dates))).normalize().unique().sort_values()
     n_total = len(dates)
     wanted_iso = {str(d.date()) for d in dates}
@@ -881,3 +900,574 @@ def plot_year_overview(table: pd.DataFrame, rollup: pd.DataFrame, period_label: 
     if save_path:
         fig.savefig(save_path, dpi=150)
     return fig
+
+
+# #############################################################################
+# 10. ЕДИНЫЙ ПРОТОКОЛ ОЦЕНКИ PROPHET (задачи 1-2)
+#     Точка прогноза — 00:00 суток D, горизонт 24 ч, переобучение каждый день (расширяющееся окно);
+#     один тест-период и одна предобработка для всех методов; гиперпараметры — только на валидации до теста;
+#     оценка «по всем часам» и отдельно «пиковый режим» (топ-k часов суток).
+# #############################################################################
+# =============================================================================
+# 10.1 ПРОТОКОЛ: ДАННЫЕ ПАНЕЛИ РЕГИОНОВ И ПРОСТРАНСТВЕННАЯ СТРУКТУРА
+# =============================================================================
+def discover_region_files(folder: str = ".", pattern: str = "electricity_*.csv") -> dict[str, str]:
+    """{'75': 'electricity_75.csv', '71': ...} по шаблону имени."""
+    out = {}
+    for p in sorted(glob.glob(os.path.join(folder, pattern))):
+        m = re.search(r"electricity_(\d+)\.csv$", os.path.basename(p))
+        if m:
+            out[m.group(1)] = p
+    return out
+
+
+def load_panel(region_files: dict[str, str], cache_dir: str, target_col: str = "actual_consumption",
+               encoding: str | None = None):
+    """
+    Каждый регион проходит ОДНУ И ТУ ЖЕ предобработку (prophet_pipeline.validate_and_clean),
+    затем все регионы выравниваются на общую почасовую сетку (пересечение периодов).
+    Возвращает (cons: DataFrame[время x регион], price: DataFrame | None).
+    """
+    os.makedirs(cache_dir, exist_ok=True)
+    cons, price = {}, {}
+    for code, path in region_files.items():
+        df = load_clean_cached(path, os.path.join(cache_dir, f"clean_{code}.pkl"),
+                               target_col=target_col, region=code, encoding=encoding)
+        cons[code] = df[target_col]
+        if "average_price" in df.columns:
+            price[code] = df["average_price"]
+    start = max(s.index.min() for s in cons.values())
+    end = min(s.index.max() for s in cons.values())
+    cons_df = pd.DataFrame(cons).loc[start:end].asfreq("h").ffill()
+    price_df = None
+    if len(price) == len(cons):
+        price_df = pd.DataFrame(price).loc[start:end].asfreq("h").ffill()
+    return cons_df, price_df
+
+
+def spatial_neighbors(cons: pd.DataFrame, fit_end: pd.Timestamp, k: int = 3):
+    """
+    Пространственная связь по ДАННЫМ (не по географии): корреляция остатков потребления
+    между регионами после удаления профиля «день недели x час» и недельного тренда.
+    Считается ТОЛЬКО по данным до начала теста (fit_end) — утечки нет.
+    Возвращает (матрица корреляций, {регион: [k самых связанных регионов]}).
+    """
+    tr = np.log(cons.loc[:fit_end])
+    prof = tr.groupby([tr.index.dayofweek, tr.index.hour]).transform("mean")
+    resid = tr - prof
+    resid = resid - resid.rolling(168, min_periods=24).mean()
+    corr = resid.corr()
+    nbrs = {}
+    for r in corr.columns:
+        nbrs[r] = list(corr[r].drop(r).sort_values(ascending=False).index[:k])
+    return corr, nbrs
+
+
+# =============================================================================
+# 10.2 ПРИЗНАКИ (все лаги >= 24 ч относительно целевого часа)
+# =============================================================================
+def _region_features(y: pd.Series) -> pd.DataFrame:
+    """
+    Единственный признак — r_l24 = y(t-24ч) / scale, где scale = среднее за 168 ч, оканчивающихся в t-24ч.
+    Прогноз делается в 00:00 суток t, поэтому для t известно только y(s) при s <= t-24ч => утечки нет.
+    Отношение к scale делает ряды разных регионов сопоставимыми (используется для регрессора соседей).
+    """
+    scale = y.rolling(168, min_periods=168).mean().shift(24)
+    f = pd.DataFrame({"r_l24": y.shift(24) / scale}, index=y.index)
+    return f.replace([np.inf, -np.inf], np.nan)
+
+
+class Context:
+    """Общие данные: панель регионов, цены, соседи, лаг-24 соседей, настройки."""
+
+    def __init__(self, cons: pd.DataFrame, price: pd.DataFrame | None, neighbors: dict,
+                 max_train_days: int | None = None, seed: int = 42):
+        self.cons, self.price, self.neighbors = cons, price, neighbors
+        self.regions = list(cons.columns)
+        self.max_train_days, self.seed = max_train_days, seed
+        self.feats = {r: _region_features(cons[r]) for r in self.regions}
+        for r in self.regions:                                                  # лаг-24 соседей (среднее по k соседям)
+            nb = neighbors.get(r, [])
+            self.feats[r]["nb_r_l24"] = np.mean([self.feats[n]["r_l24"].values for n in nb], axis=0) if nb else np.nan
+
+    def day_index(self, day: pd.Timestamp) -> pd.DatetimeIndex:
+        return pd.date_range(day, periods=24, freq="h")
+
+    def window(self, obj, day: pd.Timestamp, mtd: int | None):
+        """Данные строго ДО day 00:00; при mtd — только последние mtd дней."""
+        lo = None if mtd is None else day - pd.Timedelta(days=mtd)
+        return obj.loc[lo: day - H1]
+
+
+# =============================================================================
+# 10.3 МЕТОД (Prophet и его варианты) (единый интерфейс: predict_day(day, regions) -> {регион: DataFrame[yhat, lower, upper]})
+# =============================================================================
+def _frame(idx, yhat, lo=None, hi=None) -> pd.DataFrame:
+    nan = np.full(len(idx), np.nan)
+    return pd.DataFrame({"yhat": np.asarray(yhat, float),
+                         "yhat_lower": nan if lo is None else np.asarray(lo, float),
+                         "yhat_upper": nan if hi is None else np.asarray(hi, float)}, index=idx)
+
+
+class Method:
+    DEFAULT_PARAMS: dict = {}
+    PARAM_GRID: dict = {}
+
+    def __init__(self, ctx: Context, **params):
+        self.ctx = ctx
+        self.params = {**self.DEFAULT_PARAMS, **params}
+        self.mtd = self.params.pop("max_train_days", ctx.max_train_days)
+
+    def predict_day(self, day, regions):
+        raise NotImplementedError
+
+
+class ProphetM(Method):
+    """
+    Prophet (если установлен; иначе Fourier-GAM из prophet_pipeline — тогда это НЕ Prophet).
+    reg — список внешних регрессоров:
+        'price_now'   — цена в тот же час (как в текущем main.py; в момент прогноза её нет => УТЕЧКА, для справки)
+        'price_lag24' — цена те же сутки назад (известна на момент прогноза)
+        'nbr'         — лаг-24 потребления соседних регионов (пространственный регрессор)
+    """
+    DEFAULT_PARAMS = {"cps": 0.05, "ridge_alpha": 1.0, "reg": ()}
+    PARAM_GRID = {"cps": [0.01, 0.05, 0.1]} if _HAS_REAL_PROPHET else {"ridge_alpha": [0.1, 1.0, 10.0, 100.0]}
+
+    def _regressors(self, r) -> pd.DataFrame:
+        c, cols = self.ctx, {}
+        for name in self.params["reg"]:
+            if name in ("price_now", "price_lag24"):
+                if c.price is None:
+                    continue                                    # нет цены хотя бы в одном регионе — регрессор не используем
+                cols["price"] = c.price[r] if name == "price_now" else c.price[r].shift(24)
+            elif name == "nbr":
+                cols["nbr"] = c.feats[r]["nb_r_l24"]
+        return pd.DataFrame(cols, index=c.cons.index)
+
+    def predict_day(self, day, regions):
+        c, p, idx, out = self.ctx, self.params, self.ctx.day_index(day), {}
+        for r in regions:
+            y = c.window(c.cons[r], day, self.mtd)
+            regs = self._regressors(r)
+            train = pd.DataFrame({"ds": y.index, "y": y.values})
+            future = pd.DataFrame({"ds": idx})
+            for col in regs:
+                train[col] = regs[col].reindex(y.index).values
+                future[col] = regs[col].reindex(idx).ffill().bfill().values
+            train = train.dropna()
+            hol = russian_holidays(range(train["ds"].dt.year.min(), day.year + 2))
+            if _HAS_REAL_PROPHET:
+                m = Prophet(growth="linear", daily_seasonality=True, weekly_seasonality=True,
+                            yearly_seasonality=True, holidays=hol, interval_width=0.8,
+                            changepoint_prior_scale=p["cps"])
+            else:
+                m = Prophet(interval_width=0.8, alpha=p["ridge_alpha"], holidays=hol)
+            for col in regs:
+                m.add_regressor(col)
+            state = np.random.get_state()                       # как в prophet_pipeline: seed от даты => воспроизводимо
+            np.random.seed(int(day.strftime("%Y%m%d")))
+            try:
+                m.fit(train)
+                fc = m.predict(future)
+            finally:
+                np.random.set_state(state)
+            out[r] = _frame(idx, fc["yhat"], fc["yhat_lower"], fc["yhat_upper"])
+        return out
+
+
+# имя -> (класс, фиксированные параметры). Эти параметры НЕ подбираются, подбирается PARAM_GRID класса.
+REGISTRY = {
+    "prophet_current": (ProphetM, {"reg": ("price_now",)}),            # как в прежнем main.py (утечка цены), для справки
+    "prophet":         (ProphetM, {"reg": ("price_lag24",)}),          # честный: цена сутки назад
+    "prophet_nbr":     (ProphetM, {"reg": ("price_lag24", "nbr")}),    # + лаг-24 соседних регионов (пространство)
+}
+
+
+def make_method(name: str, ctx: Context, tuned: dict | None = None, **extra) -> Method:
+    cls, fixed = REGISTRY[name]
+    return cls(ctx, **{**fixed, **(tuned or {}), **extra})
+
+
+# =============================================================================
+# 10.4 ЗАПУСК: параллелизм, чекпоинты, подбор гиперпараметров
+# =============================================================================
+def _run_chunk(method: Method, name: str, jobs: list):
+    """jobs: [(день, [регионы])]. Возвращает (DataFrame прогнозов | None, [ошибки])."""
+    frames, errors = [], []
+    for day, regions in jobs:
+        try:
+            for r, fc in method.predict_day(day, regions).items():
+                f = fc.copy()
+                f.index.name = "ds"
+                f = f.reset_index()
+                f["region"], f["method"] = r, name
+                f["y"] = method.ctx.cons[r].reindex(f["ds"]).values
+                frames.append(f)
+        except Exception as e:                                   # один сбойный день не должен ронять год расчёта
+            errors.append((str(day.date()), repr(e)))
+    return (pd.concat(frames, ignore_index=True) if frames else None), errors
+
+
+FC_COLS = ["method", "region", "ds", "y", "yhat", "yhat_lower", "yhat_upper"]
+
+
+def _predict_days(method, name, jobs, n_jobs, chunk_days, on_batch=None):
+    n_workers = max(1, effective_n_jobs(n_jobs))
+    chunks = [jobs[i:i + chunk_days] for i in range(0, len(jobs), chunk_days)]
+    batch = n_workers * 2 if n_workers > 1 else 1
+    all_frames, all_err, done, t0 = [], [], 0, time.perf_counter()
+    for b in range(0, len(chunks), batch):
+        group = chunks[b:b + batch]
+        if n_workers > 1:
+            res = Parallel(n_jobs=n_workers)(delayed(_run_chunk)(method, name, c) for c in group)
+        else:
+            res = [_run_chunk(method, name, c) for c in group]
+        new = [f for f, _ in res if f is not None]
+        for _, e in res:
+            all_err += e
+        if new:
+            df = pd.concat(new, ignore_index=True)[FC_COLS]
+            all_frames.append(df)
+            if on_batch:
+                on_batch(df)
+        done += sum(len(c) for c in group)
+        el = time.perf_counter() - t0
+        print(f"    [{name}] {done}/{len(jobs)} дн.  (~{el / done:.1f} с/день, осталось ~{el / done * (len(jobs) - done) / 60:.1f} мин)")
+    out = pd.concat(all_frames, ignore_index=True) if all_frames else pd.DataFrame(columns=FC_COLS)
+    return out, all_err
+
+
+def run_method(name, ctx, days, regions, out_dir, tuned=None, n_jobs=1, chunk_days=5, resume=True):
+    """Прогноз method на days x regions; почасовые прогнозы дописываются в out_dir/forecasts/<method>.csv."""
+    os.makedirs(os.path.join(out_dir, "forecasts"), exist_ok=True)
+    path = os.path.join(out_dir, "forecasts", f"{name}.csv")
+    sig = json.loads(json.dumps({"params": tuned or {}, "max_train_days": ctx.max_train_days}))
+    sig_path = os.path.join(out_dir, "forecasts", f"{name}.sig.json")
+    if resume and os.path.exists(path):
+        old_sig = json.load(open(sig_path)) if os.path.exists(sig_path) else None
+        if old_sig != sig:
+            print(f"  [{name}] параметры или окно обучения изменились — старые прогнозы удалены, считаем заново")
+            os.remove(path)
+    json.dump(sig, open(sig_path, "w"))
+    have = set()
+    if resume and os.path.exists(path):
+        old = pd.read_csv(path, usecols=["region", "ds"], parse_dates=["ds"], dtype={"region": str})
+        cnt = old.groupby(["region", old["ds"].dt.normalize()]).size()
+        have = set(cnt[cnt == 24].index)
+    elif os.path.exists(path):
+        os.remove(path)
+    jobs = []
+    for d in days:
+        miss = [r for r in regions if (r, d) not in have]
+        if miss:
+            jobs.append((d, miss))
+    if not jobs:
+        print(f"  [{name}] всё уже посчитано — пропуск")
+        return
+    method = make_method(name, ctx, tuned)
+    print(f"  [{name}] к расчёту {len(jobs)} дн. (регионов: {len(regions)}), параметры: {tuned or 'по умолчанию'}")
+
+    def _append(df):
+        df.to_csv(path, mode="a", header=not os.path.exists(path), index=False)
+
+    _, errors = _predict_days(method, name, jobs, n_jobs, chunk_days, on_batch=_append)
+    if errors:
+        print(f"  [{name}] ОШИБКИ в {len(errors)} дн., они выпадут из общей выборки: {errors[:3]}")
+
+
+def load_forecasts(out_dir: str, methods=None) -> pd.DataFrame:
+    parts = []
+    for p in sorted(glob.glob(os.path.join(out_dir, "forecasts", "*.csv"))):
+        if methods is None or os.path.splitext(os.path.basename(p))[0] in methods:
+            parts.append(pd.read_csv(p, parse_dates=["ds"], dtype={"region": str}))
+    fc = pd.concat(parts, ignore_index=True)
+    return fc.drop_duplicates(["method", "region", "ds"], keep="last")
+
+
+def tune_method(name, ctx, val_days, regions, n_jobs=1, criterion="mape+peak_mape"):
+    """
+    Перебор PARAM_GRID класса метода на валидации (дни строго до теста, то же расширяющееся окно).
+    Критерий: MAPE по всем часам + MAPE в фактические топ-3 часа (среднее по регионам) — баланс «в целом»
+    и «в пиках»; чистый peak-критерий поощрял бы завышение прогноза. Тест при этом не используется.
+    """
+    cls, fixed = REGISTRY[name]
+    grid = cls.PARAM_GRID
+    if not grid:
+        return {}, pd.DataFrame()
+    keys, rows = list(grid), []
+    jobs = [(d, list(regions)) for d in val_days]
+    for vals in itertools.product(*grid.values()):
+        combo = dict(zip(keys, vals))
+        method = make_method(name, ctx, combo)
+        fc, err = _predict_days(method, name, jobs, n_jobs, chunk_days=max(1, len(jobs) // max(1, 2 * effective_n_jobs(n_jobs))))
+        if fc.empty:
+            continue
+        daily = evaluate_forecasts(common_days(fc))
+        s = daily[["mape", "peak_mape"]].mean()
+        rows.append({"method": name, **combo, "val_MAPE": s["mape"], "val_peak_MAPE": s["peak_mape"],
+                     "criterion": s["mape"] + s["peak_mape"], "val_days": daily["date"].nunique()})
+        print(f"    tune[{name}] {combo}: MAPE={s['mape']:.2f}  peakMAPE={s['peak_mape']:.2f}")
+    log = pd.DataFrame(rows).sort_values("criterion").reset_index(drop=True)
+    best = {k: log.loc[0, k] for k in keys}
+    best = {k: (v.item() if hasattr(v, "item") else v) for k, v in best.items()}
+    return best, log
+
+
+# =============================================================================
+# 10.5 МЕТРИКИ И СТАТИСТИКА
+# =============================================================================
+def common_days(fc: pd.DataFrame) -> pd.DataFrame:
+    """Оставляет только пары (регион, сутки), которые есть у ВСЕХ методов, целиком (24 ч) и без NaN."""
+    fc = fc.dropna(subset=["y", "yhat"]).copy()
+    fc["date"] = fc["ds"].dt.normalize()
+    cnt = fc.groupby(["region", "date", "method"]).size().unstack("method")
+    ok = (cnt == 24).all(axis=1)
+    keep = ok[ok].index.to_frame(index=False)
+    return fc.merge(keep, on=["region", "date"]).sort_values(["method", "region", "ds"]).reset_index(drop=True)
+
+
+def _daily_metrics(Y, P, R, L, U, k: int) -> dict:
+    """Y,P,R,L,U: (дни x 24). R — по чему ранжируем часы (yhat или yhat_upper)."""
+    err = np.abs(P - Y)
+    mt = np.zeros_like(Y, bool)
+    mp = np.zeros_like(Y, bool)
+    np.put_along_axis(mt, np.argsort(-Y, axis=1, kind="stable")[:, :k], True, axis=1)
+    np.put_along_axis(mp, np.argsort(-R, axis=1, kind="stable")[:, :k], True, axis=1)
+    dil = mt.copy()                                    # фактические пики +-1 час
+    dil[:, 1:] |= mt[:, :-1]
+    dil[:, :-1] |= mt[:, 1:]
+    at, ap = Y.argmax(1), R.argmax(1)
+    return {
+        "mae": err.mean(1), "mse": (err ** 2).mean(1), "mape": (err / Y).mean(1) * 100,
+        "smape": (2 * err / (np.abs(P) + np.abs(Y))).mean(1) * 100,
+        # --- пиковый режим ---
+        "hits": (mt & mp).sum(1),                                          # сколько из k предсказанных часов угадано точно
+        "hits_tol": (dil & mp).sum(1),                                     # ... с допуском +-1 час
+        "top1": (at == ap).astype(float), "top1_tol": (np.abs(at - ap) <= 1).astype(float),
+        "capture": np.where(mp, Y, 0).sum(1) / np.where(mt, Y, 0).sum(1) * 100,  # какую долю пиковой нагрузки «поймали»
+        "peak_mae": (err * mt).sum(1) / k, "peak_mape": (err / Y * mt).sum(1) / k * 100,
+        "peak_bias": ((P - Y) * mt).sum(1) / k,                            # знак: <0 — пики занижаются
+        "dmax_mape": np.abs(P.max(1) - Y.max(1)) / Y.max(1) * 100,
+        "coverage": ((Y >= L) & (Y <= U)).mean(1) * 100 if not np.isnan(L).any() else np.full(len(Y), np.nan),
+    }
+
+
+def evaluate_forecasts(fc: pd.DataFrame, k: int = 3) -> pd.DataFrame:
+    """fc — результат common_days. Возвращает дневную таблицу метрик (method, region, date, ...)."""
+    rows = []
+    for (m, r), g in fc.groupby(["method", "region"], sort=False):
+        g = g.sort_values("ds")
+        arr = lambda c: g[c].to_numpy(float).reshape(-1, 24)
+        Y, P, L, U = arr("y"), arr("yhat"), arr("yhat_lower"), arr("yhat_upper")
+        days = pd.DatetimeIndex(g["ds"].dt.normalize().iloc[::24])
+        variants = [(P, m)]
+        if not np.isnan(U).any():
+            variants.append((U, f"{m} [ранг по upper]"))
+        for R, label in variants:
+            d = pd.DataFrame(_daily_metrics(Y, P, R, L, U, k))
+            d["method"], d["region"], d["date"] = label, r, days
+            rows.append(d)
+    return pd.concat(rows, ignore_index=True)
+
+
+def summarize(daily: pd.DataFrame, k: int = 3) -> pd.DataFrame:
+    daily = daily.assign(all3=(daily["hits"] == k).astype(float) * 100, zero=(daily["hits"] == 0).astype(float) * 100)
+    s = daily.groupby(["method", "region"], sort=False).agg(
+        days=("mae", "size"), MAE=("mae", "mean"), MSE=("mse", "mean"), MAPE=("mape", "mean"),
+        sMAPE=("smape", "mean"), top3_hit=("hits", "mean"), top3_tol1=("hits_tol", "mean"),
+        top1_hit=("top1", "mean"), top1_tol1=("top1_tol", "mean"), capture=("capture", "mean"),
+        peak_MAE=("peak_mae", "mean"), peak_MAPE=("peak_mape", "mean"), peak_bias=("peak_bias", "mean"),
+        dmax_MAPE=("dmax_mape", "mean"), coverage80=("coverage", "mean"),
+        all3_days=("all3", "mean"), zero_days=("zero", "mean")).reset_index()
+    s["RMSE"] = np.sqrt(s.pop("MSE"))
+    for c in ("top3_hit", "top3_tol1"):
+        s[c] = s[c] / k * 100
+    for c in ("top1_hit", "top1_tol1"):
+        s[c] *= 100
+    cols = ["method", "region", "days", "top3_hit", "top3_tol1", "all3_days", "zero_days", "top1_hit", "top1_tol1",
+            "capture", "peak_MAE", "peak_MAPE", "peak_bias", "dmax_MAPE", "MAE", "RMSE", "MAPE", "sMAPE", "coverage80"]
+    return s[cols]
+
+
+def summarize_all(summary: pd.DataFrame) -> pd.DataFrame:
+    """Среднее по регионам (макро-среднее) — по одной строке на метод."""
+    num = [c for c in summary.columns if c not in ("method", "region")]
+    return summary.groupby("method", sort=False)[num].mean().reset_index()
+
+
+def paired_stat(a: pd.Series, b: pd.Series, n_boot: int = 2000, block: int = 7, seed: int = 0) -> dict:
+    """
+    Парное сравнение по дням: d = b - a. Среднее d, 95% ДИ блочным бутстрэпом (блок = неделя, ряд
+    автокоррелирован) и p-value критерия Уилкоксона (ненулевые d, двусторонний).
+    """
+    d = (b - a).dropna().to_numpy(float)
+    n = len(d)
+    if n < 5:
+        return {"diff": np.nan, "ci_lo": np.nan, "ci_hi": np.nan, "p": np.nan, "n": n}
+    rng = np.random.default_rng(seed)
+    block = max(1, min(block, n // 4))
+    nb = math.ceil(n / block)
+    starts = rng.integers(0, n, size=(n_boot, nb))
+    idx = (starts[:, :, None] + np.arange(block)) % n
+    means = d[idx].reshape(n_boot, -1)[:, :n].mean(1)
+    try:
+        p = wilcoxon(d).pvalue if np.any(d != 0) else 1.0
+    except ValueError:
+        p = np.nan
+    return {"diff": d.mean(), "ci_lo": np.quantile(means, 0.025), "ci_hi": np.quantile(means, 0.975), "p": p, "n": n}
+
+
+MIN_DAYS_FOR_VERDICT = 30
+LOWER_IS_BETTER = {"mae": True, "mape": True, "peak_mape": True, "peak_mae": True, "dmax_mape": True,
+                   "hits": False, "hits_tol": False, "capture": False, "top1": False}
+
+
+def pairs_table(daily: pd.DataFrame, pairs: list[tuple[str, str]],
+                metrics=("hits", "hits_tol", "top1", "capture", "peak_mae", "peak_mape", "mae", "mape"),
+                regions=None) -> pd.DataFrame:
+    """Для каждой пары (база, новый) и метрики: разница (новый - база), ДИ, p, вывод. По регионам и «ВСЕ» (среднее по регионам по дням)."""
+    out = []
+    regs = regions or sorted(daily["region"].unique())
+    for base, new in pairs:
+        for metric in metrics:
+            piv = daily.pivot_table(index=["region", "date"], columns="method", values=metric)
+            if base not in piv or new not in piv:
+                continue
+            for scope in regs + ["ВСЕ"]:
+                if scope == "ВСЕ":
+                    sub = piv[[base, new]].groupby(level="date").mean()
+                else:
+                    sub = piv[[base, new]].xs(scope, level="region")
+                st = paired_stat(sub[base], sub[new])
+                lower = LOWER_IS_BETTER[metric]
+                better = (st["ci_hi"] < 0) if lower else (st["ci_lo"] > 0)
+                worse = (st["ci_lo"] > 0) if lower else (st["ci_hi"] < 0)
+                if st["n"] < MIN_DAYS_FOR_VERDICT:
+                    verdict = f"мало дней (n<{MIN_DAYS_FOR_VERDICT}) — вывод не делаем"
+                else:
+                    verdict = "лучше" if better else "хуже" if worse else "без значимой разницы"
+                out.append({"база": base, "новый": new, "регион": scope, "метрика": metric,
+                            "среднее_база": sub[base].mean(), "среднее_новый": sub[new].mean(), **st,
+                            "вывод(95% ДИ)": verdict})
+    return pd.DataFrame(out)
+
+
+# =============================================================================
+# 10.6 ВЫВОД: графики и markdown
+# =============================================================================
+def df_to_md(df: pd.DataFrame, digits: int = 2) -> str:
+    def fmt(v):
+        if isinstance(v, (float, np.floating)):
+            return "" if np.isnan(v) else f"{v:.{digits}f}"
+        return str(v)
+    head = "| " + " | ".join(map(str, df.columns)) + " |\n|" + "---|" * len(df.columns) + "\n"
+    return head + "\n".join("| " + " | ".join(fmt(v) for v in row) + " |" for row in df.itertuples(index=False)) + "\n"
+
+
+def plot_summary_bars(s_all: pd.DataFrame, path: str, title: str = ""):
+    s = s_all.sort_values("peak_MAPE")
+    fig, axes = plt.subplots(1, 3, figsize=(16, max(4, 0.35 * len(s) + 1.5)), sharey=True)
+    for ax, col, lab in zip(axes, ["MAPE", "peak_MAPE", "top3_hit"],
+                            ["MAPE, все часы, %", "MAPE в фактические топ-3 часа, %", "Попадание в топ-3 (точно), %"]):
+        ax.barh(s["method"], s[col], color="tab:green" if col == "top3_hit" else "tab:blue")
+        ax.set_title(lab)
+        ax.grid(axis="x", alpha=0.3)
+    axes[0].invert_yaxis()
+    fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+
+
+def plot_corr(corr: pd.DataFrame, path: str):
+    fig, ax = plt.subplots(figsize=(1 + 0.8 * len(corr), 1 + 0.7 * len(corr)))
+    im = ax.imshow(corr.values, cmap="viridis", vmin=0, vmax=1)
+    ax.set_xticks(range(len(corr)), corr.columns)
+    ax.set_yticks(range(len(corr)), corr.index)
+    for i in range(len(corr)):
+        for j in range(len(corr)):
+            ax.text(j, i, f"{corr.values[i, j]:.2f}", ha="center", va="center", color="w", fontsize=8)
+    ax.set_title("Корреляция остатков потребления между регионами (до начала теста)")
+    fig.colorbar(im)
+    fig.tight_layout()
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+
+
+def plot_spatial_delta(tbl: pd.DataFrame, metric: str, path: str):
+    t = tbl[(tbl["метрика"] == metric) & (tbl["регион"] != "ВСЕ")]
+    if t.empty:
+        return
+    t = t.assign(пара=t["база"] + " → " + t["новый"]).pivot(index="регион", columns="пара", values="diff")
+    fig, ax = plt.subplots(figsize=(2 + 2.2 * t.shape[1], 1.5 + 0.5 * len(t)))
+    v = np.nanmax(np.abs(t.values)) or 1
+    im = ax.imshow(t.values, cmap="RdBu_r" if LOWER_IS_BETTER[metric] else "RdBu", vmin=-v, vmax=v, aspect="auto")
+    ax.set_xticks(range(t.shape[1]), t.columns, rotation=20, ha="right")
+    ax.set_yticks(range(len(t)), t.index)
+    for i in range(t.shape[0]):
+        for j in range(t.shape[1]):
+            ax.text(j, i, f"{t.values[i, j]:+.2f}", ha="center", va="center", fontsize=8,
+                    color="w" if abs(t.values[i, j]) > 0.6 * v else "k")
+    ax.set_title(f"Δ {metric} (новый − база), синий = лучше" if LOWER_IS_BETTER[metric] else f"Δ {metric} (новый − база)")
+    fig.colorbar(im)
+    fig.tight_layout()
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+
+
+RU_WEEKDAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
+
+def plot_daily_forecasts_pdf(fc: pd.DataFrame, path: str, title: str, main_method: str = "prophet", k: int = 3):
+    """
+    Один PDF, по странице на месяц; каждая клетка — ОДИН день: факт и прогноз по 24 часам.
+    Красные кружки — фактические топ-k часов, треугольники — топ-k часов по прогнозу main_method;
+    в заголовке клетки — сколько из k часов угадано. fc — прогнозы ОДНОГО региона (после common_days).
+    """
+    from matplotlib.backends.backend_pdf import PdfPages
+    methods = sorted(fc["method"].unique(), key=lambda m: (m != main_method, m))
+    palette = {main_method: dict(color="tab:blue", lw=1.5), "prophet_current": dict(color="tab:gray", lw=1.1, ls="--"),
+               "prophet_nbr": dict(color="tab:green", lw=1.3)}
+    fc = fc.copy()
+    fc["date"] = fc["ds"].dt.normalize()
+    with PdfPages(path) as pdf:
+        for (yr, mo), g in fc.groupby([fc["date"].dt.year, fc["date"].dt.month]):
+            days = sorted(g["date"].unique())
+            ncol = 6
+            nrow = math.ceil(len(days) / ncol)
+            fig, axes = plt.subplots(nrow, ncol, figsize=(24, 3.3 * nrow + 1.3), squeeze=False)
+            for ax in axes.ravel():
+                ax.axis("off")
+            for ax, d in zip(axes.ravel(), days):
+                ax.axis("on")
+                gd = g[g["date"] == d]
+                act = gd.drop_duplicates("ds").sort_values("ds")
+                hrs = act["ds"].dt.hour.to_numpy()
+                ya = act["y"].to_numpy()
+                ax.plot(hrs, ya, "k-", lw=1.8, label="факт")
+                top_a = np.argsort(-ya)[:k]
+                ax.scatter(hrs[top_a], ya[top_a], s=55, facecolors="none", edgecolors="red", linewidths=1.5, zorder=5,
+                           label=f"факт: топ-{k} часа")
+                hit = None
+                for m in methods:
+                    gm = gd[gd["method"] == m].sort_values("ds")
+                    st = palette.get(m, dict(color="tab:orange", lw=1.2))
+                    ax.plot(gm["ds"].dt.hour, gm["yhat"], label=m, **st)
+                    if m == main_method:
+                        yp = gm["yhat"].to_numpy()
+                        top_p = np.argsort(-yp)[:k]
+                        ax.scatter(hrs[top_p], yp[top_p], marker="^", s=45, color=st["color"], zorder=6,
+                                   label=f"прогноз: топ-{k} часа ({m})")
+                        hit = len(set(top_a) & set(top_p))
+                ax.set_title(f"{pd.Timestamp(d):%d.%m} {RU_WEEKDAYS[pd.Timestamp(d).dayofweek]}"
+                             + (f"   угадано {hit}/{k}" if hit is not None else ""), fontsize=10)
+                ax.set_xticks([0, 6, 12, 18, 23])
+                ax.tick_params(labelsize=7)
+                ax.grid(alpha=0.3)
+            h, l = axes[0, 0].get_legend_handles_labels()
+            fig_h = fig.get_size_inches()[1]
+            fig.suptitle(f"{title} — {yr}-{mo:02d}", y=1 - 0.12 / fig_h, va="top", fontsize=13)
+            fig.legend(h, l, loc="upper center", bbox_to_anchor=(0.5, 1 - 0.55 / fig_h), ncol=len(l), fontsize=10)
+            fig.tight_layout(rect=(0, 0, 1, 1 - 1.0 / fig_h))
+            pdf.savefig(fig)
+            plt.close(fig)
