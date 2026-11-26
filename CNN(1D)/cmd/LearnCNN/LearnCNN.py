@@ -1,19 +1,28 @@
 import os
-import re
-import pickle
-import argparse
+import random
+import warnings
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_absolute_error, mean_squared_error
-
 import tensorflow as tf
+
 from tensorflow.keras import Sequential
-from tensorflow.keras.layers import Input, Conv1D, Dense, Flatten, Dropout
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.layers import (
+    Input,
+    Conv1D,
+    MaxPooling1D,
+    Flatten,
+    Dense,
+    Dropout,
+)
+from tensorflow.keras.callbacks import (
+    EarlyStopping,
+    ReduceLROnPlateau,
+)
+
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 
 # ============================================================
@@ -21,13 +30,12 @@ from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 # ============================================================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_PATH = os.path.join(BASE_DIR, "../../..", "datasets", "electricity_75.csv")
-
-MODEL_DIR = os.path.join(BASE_DIR, "models")
-RESULTS_DIR = os.path.join(BASE_DIR, "results")
-
-MODEL_PATH = os.path.join(MODEL_DIR, "cnn_168.keras")
-SCALER_PATH = os.path.join(MODEL_DIR, "scaler.pkl")
+DATA_PATH = os.path.join(
+    BASE_DIR,
+    "../../..",
+    "datasets",
+    "electricity_75.csv"
+)
 
 # Historical data used for training
 TRAIN_START = "2021-01-01"
@@ -38,75 +46,61 @@ TEST_START = "2026-01-01"
 TEST_END = "2026-12-31 23:00:00"
 
 # CNN parameters
-WINDOW_SIZE = 168       # 7 days
-FORECAST_HORIZON = 24   # next 24 hours
+WINDOW_SIZE = 168
+FORECAST_HORIZON = 24
 
 EPOCHS = 50
 BATCH_SIZE = 32
 
 RANDOM_SEED = 42
 
+# Training parameters
+VALIDATION_SPLIT = 0.1
+EARLY_STOPPING_PATIENCE = 8
+REDUCE_LR_PATIENCE = 4
+
+# Output directory
+RESULTS_DIR = os.path.join(
+    BASE_DIR,
+    "results",
+    "rolling_2026"
+)
+
+METRICS_PATH = os.path.join(
+    RESULTS_DIR,
+    "rolling_daily_metrics.csv"
+)
+
+PREDICTIONS_PATH = os.path.join(
+    RESULTS_DIR,
+    "rolling_predictions.csv"
+)
+
+SUMMARY_PATH = os.path.join(
+    RESULTS_DIR,
+    "rolling_summary.txt"
+)
+
+BOXPLOT_PATH = os.path.join(
+    RESULTS_DIR,
+    "rolling_boxplot.png"
+)
+
+MONTHLY_PATH = os.path.join(
+    RESULTS_DIR,
+    "monthly_metrics.csv"
+)
+
 # ============================================================
-# REPRODUCIBILITY
+# RANDOM SEED
 # ============================================================
 
+os.environ["PYTHONHASHSEED"] = str(RANDOM_SEED)
+
+random.seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
-tf.random.set_seed(RANDOM_SEED)
 
-
-# ============================================================
-# UTILITY FUNCTIONS
-# ============================================================
-
-def ensure_directories():
-    os.makedirs(MODEL_DIR, exist_ok=True)
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-
-
-def parse_numeric(value):
-    """
-    Converts strings like:
-
-        '4 051 МВт*ч'
-        '935 руб./МВт*ч'
-        '4,051 МВт*ч'
-
-    into float values.
-
-    Empty values become NaN.
-    """
-
-    if pd.isna(value):
-        return np.nan
-
-    value = str(value).strip()
-
-    if value == "":
-        return np.nan
-
-    # Replace comma decimal separator if present
-    value = value.replace(",", ".")
-
-    # Remove units and spaces
-    value = value.replace("\xa0", " ")
-    value = value.replace("МВт*ч", "")
-    value = value.replace("руб./МВт*ч", "")
-    value = value.replace("МВт·ч", "")
-    value = value.replace("руб./МВт·ч", "")
-
-    # Remove ordinary spaces used as thousand separators
-    value = value.replace(" ", "")
-
-    # Leave digits, minus sign and decimal point
-    value = re.sub(r"[^0-9.\-]", "", value)
-
-    if value in ("", "-", "."):
-        return np.nan
-
-    try:
-        return float(value)
-    except ValueError:
-        return np.nan
+tf.keras.utils.set_random_seed(RANDOM_SEED)
 
 
 # ============================================================
@@ -115,8 +109,7 @@ def parse_numeric(value):
 
 def load_data(path):
     """
-    Loads the original CSV and converts it into a clean
-    hourly time series.
+    Loads the dataset and creates a continuous hourly time series.
     """
 
     print("=" * 70)
@@ -125,31 +118,13 @@ def load_data(path):
 
     if not os.path.exists(path):
         raise FileNotFoundError(
-            f"CSV file not found: {path}"
+            f"Dataset not found:\n{path}"
         )
 
-    try:
-        df = pd.read_csv(
-            path,
-            sep=None,
-            engine="python",
-            encoding="utf-8-sig",
-        )
-    except UnicodeDecodeError:
-        # Older exports may be saved in the Windows Cyrillic encoding.
-        df = pd.read_csv(
-            path,
-            sep=None,
-            engine="python",
-            encoding="cp1251",
-        )
-
-    # CSV files may include a BOM or whitespace in the first header,
-    # and the source files use either commas or tabs as separators.
-    df.columns = [
-        str(column).replace("\ufeff", "").strip().lower()
-        for column in df.columns
-    ]
+    df = pd.read_csv(
+        path,
+        encoding="utf-8-sig"
+    )
 
     required_columns = [
         "date",
@@ -160,986 +135,1057 @@ def load_data(path):
     for column in required_columns:
         if column not in df.columns:
             raise ValueError(
-                f"Required column '{column}' was not found in CSV. "
-                f"Columns found: {list(df.columns)}"
+                f"Required column is missing: {column}"
             )
 
-    # --------------------------------------------------------
-    # Date + hour -> datetime
-    # --------------------------------------------------------
-
-    df["hour"] = (
-        df["hour"]
-        .astype(str)
-        .str.extract(r"(\d+)", expand=False)
-        .astype(int)
+    df["date"] = pd.to_datetime(
+        df["date"],
+        errors="coerce"
     )
 
-    df["datetime"] = pd.to_datetime(
-        df["date"] + " " + df["hour"].astype(str).str.zfill(2),
-        format="%Y-%m-%d %H"
+    df["hour"] = pd.to_numeric(
+        df["hour"],
+        errors="coerce"
     )
 
-    # --------------------------------------------------------
-    # Convert consumption
-    # --------------------------------------------------------
-
-    df["actual_consumption"] = (
-        df["actual_consumption"]
-        .apply(parse_numeric)
+    df["actual_consumption"] = pd.to_numeric(
+        df["actual_consumption"],
+        errors="coerce"
     )
 
-    # The source dataset also contains the operator's planned consumption,
-    # which is the known forecast we can compare against on the same test hours.
-    if "planned_consumption" in df.columns:
-        df["planned_consumption"] = df["planned_consumption"].apply(parse_numeric)
-
-    # Remove invalid datetime / target rows
     df = df.dropna(
-        subset=["datetime", "actual_consumption"]
+        subset=[
+            "date",
+            "hour",
+            "actual_consumption"
+        ]
     )
 
-    # Sort chronologically
-    df = df.sort_values("datetime")
+    # Construct hourly timestamp.
+    # Example: date=2026-01-01, hour=5
+    # becomes 2026-01-01 05:00:00.
 
-    # Remove duplicate timestamps
-    duplicates = df["datetime"].duplicated().sum()
+    df["timestamp"] = (
+        df["date"].dt.normalize()
+        + pd.to_timedelta(df["hour"], unit="h")
+    )
 
-    if duplicates > 0:
-        print(
-            f"WARNING: found {duplicates} duplicate timestamps. "
-            f"Keeping the first occurrence."
-        )
+    df = df[
+        [
+            "timestamp",
+            "actual_consumption"
+        ]
+    ]
 
-        df = df.drop_duplicates(
-            subset=["datetime"],
-            keep="first"
-        )
+    df = df.sort_values("timestamp")
 
-    # Keep only required columns
-    columns = ["datetime", "actual_consumption"]
-    if "planned_consumption" in df.columns:
-        columns.append("planned_consumption")
-    result = df[columns].copy()
+    # Remove duplicate timestamps.
+    df = df.drop_duplicates(
+        subset="timestamp",
+        keep="last"
+    )
 
-    result = result.set_index("datetime")
+    df = df.set_index("timestamp")
 
-    # --------------------------------------------------------
-    # Check missing hours
-    # --------------------------------------------------------
-
+    # Convert to a continuous hourly index.
     full_index = pd.date_range(
-        start=result.index.min(),
-        end=result.index.max(),
+        start=df.index.min(),
+        end=df.index.max(),
         freq="h"
     )
 
-    missing_hours = full_index.difference(result.index)
+    df = df.reindex(full_index)
 
-    print(f"Rows: {len(result):,}")
-    print(f"From: {result.index.min()}")
-    print(f"To:   {result.index.max()}")
+    df.index.name = "timestamp"
 
-    print(
-        f"Missing hourly timestamps: "
-        f"{len(missing_hours):,}"
-    )
+    print(f"Dataset loaded: {len(df)} rows")
+    print(f"Start: {df.index.min()}")
+    print(f"End:   {df.index.max()}")
 
-    if len(missing_hours) > 0:
-        # Interpolate short internal gaps only. Longer gaps stay missing
-        # and trigger an error rather than introducing unreliable values.
-        result = result.reindex(full_index)
-        result["actual_consumption"] = result["actual_consumption"].interpolate(
-            method="time",
-            limit=2,
-            limit_area="inside",
-        )
+    missing = df["actual_consumption"].isna().sum()
 
-        unresolved_hours = result.index[
-            result["actual_consumption"].isna()
-        ]
+    print(f"Missing hourly values: {missing}")
 
-        if len(unresolved_hours) > 0:
-            print("\nFirst unresolved timestamps:")
-
-            for timestamp in unresolved_hours[:10]:
-                print(f"  {timestamp}")
-
-            raise ValueError(
-                "\nThe dataset contains gaps longer than 2 hours or "
-                "missing values at its boundaries. Fix the source data."
-            )
-
-        print(f"Interpolated missing hours: {len(missing_hours):,}")
-
-    print("\nData loaded successfully.")
-
-    return result
+    return df
 
 
 # ============================================================
-# TRAIN / TEST SPLIT
+# NORMALIZATION
 # ============================================================
 
-def split_data(df):
-    train = df.loc[
-        TRAIN_START:TRAIN_END
-    ].copy()
-
-    test = df.loc[
-        TEST_START:TEST_END
-    ].copy()
-
-    if test.empty:
-        # When the requested calendar test period is not present, use the
-        # newest 20% as a chronological holdout. Never shuffle time-series data.
-        test_size = max(
-            FORECAST_HORIZON * 7,
-            int(len(df) * 0.2),
-        )
-        split_index = len(df) - test_size
-
-        if split_index < WINDOW_SIZE + FORECAST_HORIZON:
-            raise ValueError(
-                "Not enough rows to create chronological training and test "
-                f"sets. Found {len(df)} hourly rows."
-            )
-
-        train = df.iloc[:split_index].copy()
-        test = df.iloc[split_index:].copy()
-
-        print(
-            "Configured test period is not present in the CSV; "
-            "using the latest 20% of available data as a chronological holdout."
-        )
-
-    if train.empty:
-        raise ValueError("Training dataset is empty.")
-
-    print("\n" + "=" * 70)
-    print("DATA SPLIT")
-    print("=" * 70)
-
-    print(
-        f"Train: {train.index.min()} -> "
-        f"{train.index.max()}"
-    )
-
-    print(
-        f"Test:  {test.index.min()} -> "
-        f"{test.index.max()}"
-    )
-
-    print(f"Train rows: {len(train):,}")
-    print(f"Test rows:  {len(test):,}")
-
-    return train, test
-
-
-# ============================================================
-# CREATE WINDOWS
-# ============================================================
-
-def create_windows(values, window_size, horizon):
+def fit_scaler(values):
     """
-    Converts a time series into supervised learning examples.
+    Fits a simple StandardScaler using NumPy.
 
-    Example:
+    Only training data is used.
+    """
 
-        X:
-        [168 previous hours]
+    values = np.asarray(
+        values,
+        dtype=np.float32
+    )
 
-        y:
-        [next 24 hours]
+    mean = np.mean(values)
+    std = np.std(values)
+
+    if std == 0:
+        std = 1.0
+
+    return mean, std
+
+
+def transform(values, mean, std):
+    return (values - mean) / std
+
+
+def inverse_transform(values, mean, std):
+    return values * std + mean
+
+
+# ============================================================
+# CREATE TRAINING WINDOWS
+# ============================================================
+
+def create_windows(
+    values,
+    window_size,
+    forecast_horizon
+):
+    """
+    Creates input sequences and target sequences.
+
+    X:
+        Previous 168 hours.
+
+    y:
+        Next 24 hours.
+
+    Windows containing missing values are discarded.
     """
 
     X = []
     y = []
 
-    max_start = len(values) - window_size - horizon + 1
+    values = np.asarray(
+        values,
+        dtype=np.float32
+    )
 
-    for start in range(max_start):
-        end = start + window_size
-        target_end = end + horizon
+    total_length = (
+        window_size + forecast_horizon
+    )
 
-        X.append(values[start:end])
-        y.append(values[end:target_end])
+    for i in range(
+        len(values) - total_length + 1
+    ):
 
-    X = np.array(X, dtype=np.float32)
-    y = np.array(y, dtype=np.float32)
+        input_window = values[
+            i:i + window_size
+        ]
 
-    # CNN expects:
-    # (samples, timesteps, features)
+        target_window = values[
+            i + window_size:
+            i + total_length
+        ]
 
-    X = X[..., np.newaxis]
+        if (
+            np.isnan(input_window).any()
+            or np.isnan(target_window).any()
+        ):
+            continue
+
+        X.append(input_window)
+        y.append(target_window)
+
+    if len(X) == 0:
+        return (
+            np.empty(
+                (0, window_size, 1),
+                dtype=np.float32
+            ),
+            np.empty(
+                (0, forecast_horizon),
+                dtype=np.float32
+            )
+        )
+
+    X = np.asarray(
+        X,
+        dtype=np.float32
+    )
+
+    y = np.asarray(
+        y,
+        dtype=np.float32
+    )
+
+    # CNN input shape:
+    # samples, timesteps, features
+
+    X = X.reshape(
+        X.shape[0],
+        X.shape[1],
+        1
+    )
 
     return X, y
 
 
 # ============================================================
-# MODEL
+# CNN MODEL
 # ============================================================
 
-def create_model():
-    model = Sequential([
-        Input(
-            shape=(WINDOW_SIZE, 1)
-        ),
+def build_model():
+    """
+    Creates a 1D CNN for 24-hour forecasting.
+    """
 
-        Conv1D(
-            filters=32,
-            kernel_size=3,
-            padding="same",
-            activation="relu"
-        ),
+    model = Sequential(
+        [
+            Input(
+                shape=(
+                    WINDOW_SIZE,
+                    1
+                )
+            ),
 
-        Conv1D(
-            filters=64,
-            kernel_size=3,
-            padding="same",
-            activation="relu"
-        ),
+            Conv1D(
+                filters=64,
+                kernel_size=3,
+                activation="relu",
+                padding="same"
+            ),
 
-        Conv1D(
-            filters=64,
-            kernel_size=3,
-            padding="same",
-            activation="relu"
-        ),
+            MaxPooling1D(
+                pool_size=2
+            ),
 
-        Flatten(),
+            Conv1D(
+                filters=32,
+                kernel_size=3,
+                activation="relu",
+                padding="same"
+            ),
 
-        Dense(
-            128,
-            activation="relu"
-        ),
+            Flatten(),
 
-        Dropout(0.2),
+            Dense(
+                128,
+                activation="relu"
+            ),
 
-        Dense(
-            FORECAST_HORIZON
-        )
-    ])
+            Dropout(0.2),
+
+            Dense(
+                FORECAST_HORIZON
+            )
+        ]
+    )
 
     model.compile(
         optimizer=tf.keras.optimizers.Adam(
             learning_rate=0.001
         ),
-        loss="mse",
-        metrics=["mae"]
+        loss="mse"
     )
 
     return model
 
 
 # ============================================================
-# TRAINING
+# TRAIN MODEL
 # ============================================================
 
-def train_model(train_df):
-    print("\n" + "=" * 70)
-    print("TRAINING")
-    print("=" * 70)
+def train_model(train_values):
+    """
+    Trains the CNN using all available historical data.
 
-    values = train_df[
-        "actual_consumption"
-    ].values.reshape(-1, 1)
+    The scaler is fitted only on the current training history.
+    """
 
-    # --------------------------------------------------------
-    # IMPORTANT:
-    # scaler is fitted ONLY on training data
-    # --------------------------------------------------------
+    train_values = np.asarray(
+        train_values,
+        dtype=np.float32
+    )
 
-    scaler = StandardScaler()
+    # Use only non-missing historical observations
+    valid_values = train_values[
+        ~np.isnan(train_values)
+    ]
 
-    scaled_values = scaler.fit_transform(
-        values
-    ).flatten()
+    if len(valid_values) == 0:
+        raise ValueError(
+            "No valid historical values for training."
+        )
 
-    X, y = create_windows(
+    mean, std = fit_scaler(
+        valid_values
+    )
+
+    scaled_values = transform(
+        train_values,
+        mean,
+        std
+    )
+
+    X_train, y_train = create_windows(
         scaled_values,
         WINDOW_SIZE,
         FORECAST_HORIZON
     )
 
-    print(f"X shape: {X.shape}")
-    print(f"y shape: {y.shape}")
+    if len(X_train) < 10:
+        raise ValueError(
+            "Not enough training windows."
+        )
 
-    # --------------------------------------------------------
-    # Explicit time-based validation split
-    #
-    # Last 10% of training examples = validation
-    # --------------------------------------------------------
-
-    split_index = int(
-        len(X) * 0.9
+    print(
+        f"Training samples: {len(X_train)}"
     )
 
-    X_train = X[:split_index]
-    y_train = y[:split_index]
-
-    X_val = X[split_index:]
-    y_val = y[split_index:]
-
-    print(f"Training samples:   {len(X_train):,}")
-    print(f"Validation samples: {len(X_val):,}")
-
-    model = create_model()
-
-    model.summary()
+    model = build_model()
 
     callbacks = [
         EarlyStopping(
             monitor="val_loss",
-            patience=7,
-            restore_best_weights=True
+            patience=EARLY_STOPPING_PATIENCE,
+            restore_best_weights=True,
+            verbose=0
         ),
 
         ReduceLROnPlateau(
             monitor="val_loss",
             factor=0.5,
-            patience=3,
-            min_lr=1e-6
+            patience=REDUCE_LR_PATIENCE,
+            min_lr=0.00001,
+            verbose=0
         )
     ]
 
-    history = model.fit(
+    model.fit(
         X_train,
         y_train,
-
-        validation_data=(
-            X_val,
-            y_val
-        ),
-
         epochs=EPOCHS,
         batch_size=BATCH_SIZE,
-
-        # VERY IMPORTANT for time series
+        validation_split=VALIDATION_SPLIT,
         shuffle=False,
-
         callbacks=callbacks,
-
-        verbose=1
+        verbose=0
     )
 
-    return model, scaler, history
-
-
-def plot_training_history(history):
-    """Save model loss and MAE curves as a PNG image."""
-    metrics = history.history
-    epochs = range(1, len(metrics["loss"]) + 1)
-
-    fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
-
-    axes[0].plot(epochs, metrics["loss"], label="Training")
-    axes[0].plot(epochs, metrics["val_loss"], label="Validation")
-    axes[0].set_title("Training loss (MSE)")
-    axes[0].set_ylabel("MSE")
-    axes[0].legend()
-    axes[0].grid(True)
-
-    if "mae" in metrics and "val_mae" in metrics:
-        axes[1].plot(epochs, metrics["mae"], label="Training")
-        axes[1].plot(epochs, metrics["val_mae"], label="Validation")
-        axes[1].set_title("Mean absolute error")
-        axes[1].set_ylabel("MAE")
-        axes[1].legend()
-        axes[1].grid(True)
-
-    axes[1].set_xlabel("Epoch")
-    fig.tight_layout()
-
-    filename = os.path.join(RESULTS_DIR, "training_history.png")
-    fig.savefig(filename, dpi=150)
-    plt.close(fig)
-    print(f"Training plot saved to: {filename}")
+    return model, mean, std
 
 
 # ============================================================
-# TEST EVALUATION
-# ============================================================
-
-def evaluate_model(model, scaler, df, test_df):
-    print("\n" + "=" * 70)
-    print("TEST EVALUATION")
-    print("=" * 70)
-
-    # We need the last WINDOW_SIZE hours before the test
-    # to construct the first test example.
-
-    test_start = test_df.index.min()
-    test_end = test_df.index.max()
-
-    history_start = (
-        test_start
-        - pd.Timedelta(hours=WINDOW_SIZE)
-    )
-
-    evaluation_df = df.loc[
-        history_start:test_end
-    ].copy()
-
-    actual_values = evaluation_df["actual_consumption"].values
-
-    scaled_values = scaler.transform(
-        actual_values.reshape(-1, 1)
-    ).flatten()
-
-    predictions_scaled = []
-    actual_scaled = []
-
-    # The first prediction starts after WINDOW_SIZE hours.
-    for start in range(
-        0,
-        len(scaled_values)
-        - WINDOW_SIZE
-        - FORECAST_HORIZON
-        + 1,
-        FORECAST_HORIZON
-    ):
-        X = scaled_values[
-            start:
-            start + WINDOW_SIZE
-        ]
-
-        y = scaled_values[
-            start + WINDOW_SIZE:
-            start + WINDOW_SIZE + FORECAST_HORIZON
-        ]
-
-        X = X.reshape(
-            1,
-            WINDOW_SIZE,
-            1
-        )
-
-        prediction = model.predict(
-            X,
-            verbose=0
-        )[0]
-
-        predictions_scaled.extend(
-            prediction
-        )
-
-        actual_scaled.extend(
-            y
-        )
-
-    predictions_scaled = np.array(
-        predictions_scaled
-    )
-
-    actual_scaled = np.array(
-        actual_scaled
-    )
-
-    predictions = scaler.inverse_transform(
-        predictions_scaled.reshape(-1, 1)
-    ).flatten()
-
-    actual = scaler.inverse_transform(
-        actual_scaled.reshape(-1, 1)
-    ).flatten()
-
-    if len(actual) == 0:
-        raise ValueError(
-            "The test set is too short to evaluate a full "
-            f"{FORECAST_HORIZON}-hour forecast."
-        )
-
-    # --------------------------------------------------------
-    # Metrics
-    # --------------------------------------------------------
-
-    prediction_index = pd.date_range(
-        start=test_start,
-        periods=len(actual),
-        freq="h",
-    )
-    comparison = pd.DataFrame({
-        "actual_consumption": actual,
-        "cnn_prediction": predictions,
-    }, index=prediction_index)
-    comparison.index.name = "datetime"
-
-    # Собираем метрики одновременно для консоли и TXT-файла.
-    metrics_lines = []
-
-    def calculate_metrics(label, predicted, actual_values):
-        predicted = np.asarray(predicted, dtype=float)
-        actual_values = np.asarray(actual_values, dtype=float)
-
-        valid = np.isfinite(predicted) & np.isfinite(actual_values)
-        predicted = predicted[valid]
-        actual_values = actual_values[valid]
-
-        if len(actual_values) == 0:
-            return None
-
-        mae_value = mean_absolute_error(actual_values, predicted)
-        rmse_value = np.sqrt(mean_squared_error(actual_values, predicted))
-
-        # MAPE нельзя корректно вычислять для фактических нулевых значений.
-        nonzero = actual_values != 0
-        if nonzero.any():
-            mape_value = np.mean(
-                np.abs((actual_values[nonzero] - predicted[nonzero]) / actual_values[nonzero])
-            ) * 100
-        else:
-            mape_value = np.nan
-
-        metrics_lines.append(
-            f"{label}:\n"
-            f"  MAE:  {mae_value:.2f} MWh\n"
-            f"  RMSE: {rmse_value:.2f} MWh\n"
-            f"  MAPE: {mape_value:.2f}%\n"
-            f"  Количество часов: {len(actual_values):,}\n"
-        )
-
-        print(
-            f"{label}: MAE={mae_value:.2f} MWh, "
-            f"RMSE={rmse_value:.2f} MWh, "
-            f"MAPE={mape_value:.2f}%"
-        )
-        return mae_value, rmse_value, mape_value
-
-    print("\nFINAL METRICS — TEST PERIOD")
-    print("-" * 70)
-    metrics_lines.append("ИТОГОВЫЕ МЕТРИКИ — ТЕСТОВЫЙ ПЕРИОД\n")
-    metrics_lines.append("=" * 70 + "\n")
-    metrics_lines.append(f"Период теста: {prediction_index.min()} — {prediction_index.max()}\n")
-    metrics_lines.append(f"Размер окна: {WINDOW_SIZE} часов\n")
-    metrics_lines.append(f"Горизонт прогноза: {FORECAST_HORIZON} часов\n")
-    metrics_lines.append(f"Количество оценённых часов: {len(actual):,}\n\n")
-
-    calculate_metrics("CNN 1D", predictions, actual)
-
-    if "planned_consumption" in evaluation_df.columns:
-        planned = evaluation_df["planned_consumption"].reindex(prediction_index).to_numpy()
-        comparison["planned_forecast"] = planned
-        valid = np.isfinite(planned) & np.isfinite(actual) & (actual != 0)
-        if valid.any():
-            print(f"\nСравнение с планом выполнено на {valid.sum():,} общих часах.")
-            metrics_lines.append("\nСРАВНЕНИЕ С ПЛАНОВЫМ ПОТРЕБЛЕНИЕМ\n")
-            metrics_lines.append(f"Количество общих часов: {valid.sum():,}\n\n")
-            calculate_metrics("Известный план (planned_consumption)", planned[valid], actual[valid])
-            calculate_metrics("CNN 1D на тех же часах", predictions[valid], actual[valid])
-        else:
-            message = "В тестовом периоде нет валидных значений planned_consumption для сравнения."
-            print(message)
-            metrics_lines.append("\n" + message + "\n")
-    else:
-        message = "В CSV нет столбца planned_consumption; сравнение с планом недоступно."
-        print(message)
-        metrics_lines.append("\n" + message + "\n")
-
-    metrics_path = os.path.join(RESULTS_DIR, "test_metrics.txt")
-    with open(metrics_path, "w", encoding="utf-8") as file:
-        file.write("".join(metrics_lines))
-    print(f"\nИтоговые метрики сохранены в TXT: {metrics_path}")
-
-    comparison_path = os.path.join(RESULTS_DIR, "test_comparison.csv")
-    comparison.to_csv(comparison_path, encoding="utf-8-sig")
-    print(f"Таблица факта, CNN и плана сохранена: {comparison_path}")
-
-    fig, ax = plt.subplots(figsize=(14, 6))
-    ax.plot(prediction_index, actual, label="Фактическое потребление", linewidth=1)
-    ax.plot(prediction_index, predictions, label="CNN 1D", linewidth=1)
-    ax.set_title("Actual vs predicted consumption on test data")
-    ax.set_xlabel("Time")
-    ax.set_ylabel("Consumption, MWh")
-    ax.legend()
-    ax.grid(True)
-    fig.tight_layout()
-
-    filename = os.path.join(RESULTS_DIR, "test_predictions.png")
-    fig.savefig(filename, dpi=150)
-    plt.close(fig)
-    print(f"Test prediction plot saved to: {filename}")
-
-    return comparison
-
-
-# ============================================================
-# FORECAST A SPECIFIC DAY
+# FORECAST ONE DAY
 # ============================================================
 
 def predict_day(
     model,
-    scaler,
-    df,
-    target_date
+    history_values,
+    mean,
+    std
 ):
     """
-    Forecasts 24 hours for target_date.
-
-    Example:
-        target_date = '2025-07-01'
+    Predicts the next 24 hours using the latest 168 hours.
     """
 
-    target_start = pd.Timestamp(
-        target_date
+    history_values = np.asarray(
+        history_values,
+        dtype=np.float32
     )
 
-    target_end = (
-        target_start
-        + pd.Timedelta(hours=23)
-    )
-
-    history_start = (
-        target_start
-        - pd.Timedelta(hours=WINDOW_SIZE)
-    )
-
-    history_end = (
-        target_start
-        - pd.Timedelta(hours=1)
-    )
-
-    # --------------------------------------------------------
-    # History
-    # --------------------------------------------------------
-
-    history = df.loc[
-        history_start:history_end
-    ]
-
-    if len(history) != WINDOW_SIZE:
+    if len(history_values) < WINDOW_SIZE:
         raise ValueError(
-            f"Expected {WINDOW_SIZE} historical hours, "
-            f"but found {len(history)}."
+            "Not enough history for forecasting."
         )
 
-    history_values = (
-        history[
-            "actual_consumption"
-        ].values
+    input_window = history_values[
+        -WINDOW_SIZE:
+    ]
+
+    if np.isnan(input_window).any():
+        raise ValueError(
+            "The last 168 hours contain missing values."
+        )
+
+    scaled_input = transform(
+        input_window,
+        mean,
+        std
     )
 
-    scaled_history = scaler.transform(
-        history_values.reshape(-1, 1)
-    ).flatten()
-
-    X = scaled_history.reshape(
+    X = scaled_input.reshape(
         1,
         WINDOW_SIZE,
         1
     )
-
-    # --------------------------------------------------------
-    # Prediction
-    # --------------------------------------------------------
 
     prediction_scaled = model.predict(
         X,
         verbose=0
     )[0]
 
-    prediction = scaler.inverse_transform(
-        prediction_scaled.reshape(-1, 1)
-    ).flatten()
-
-    forecast_index = pd.date_range(
-        start=target_start,
-        periods=FORECAST_HORIZON,
-        freq="h"
+    prediction = inverse_transform(
+        prediction_scaled,
+        mean,
+        std
     )
 
-    forecast = pd.DataFrame({
-        "datetime": forecast_index,
-        "predicted_consumption": prediction
-    })
+    return prediction
 
-    print("\n" + "=" * 70)
-    print(f"FORECAST FOR {target_date}")
-    print("=" * 70)
+
+# ============================================================
+# METRICS
+# ============================================================
+
+def calculate_metrics(
+    actual,
+    predicted
+):
+    """
+    Calculates daily MSE, RMSE, MAPE and TOP-3 Hit Rate.
+    """
+
+    actual = np.asarray(
+        actual,
+        dtype=np.float64
+    )
+
+    predicted = np.asarray(
+        predicted,
+        dtype=np.float64
+    )
+
+    if (
+        len(actual) != FORECAST_HORIZON
+        or len(predicted) != FORECAST_HORIZON
+    ):
+        raise ValueError(
+            "Actual and predicted arrays "
+            "must contain exactly 24 values."
+        )
+
+    errors = actual - predicted
+
+    mse = np.mean(
+        errors ** 2
+    )
+
+    rmse = np.sqrt(mse)
+
+    nonzero_mask = actual != 0
+
+    if nonzero_mask.any():
+        mape = np.mean(
+            np.abs(
+                errors[nonzero_mask]
+                / actual[nonzero_mask]
+            )
+        ) * 100
+    else:
+        mape = np.nan
+
+    # Indices of the 3 highest actual values
+    actual_top3 = set(
+        np.argsort(actual)[-3:]
+    )
+
+    # Indices of the 3 highest predicted values
+    predicted_top3 = set(
+        np.argsort(predicted)[-3:]
+    )
+
+    intersection = (
+        actual_top3
+        & predicted_top3
+    )
+
+    top3_hit = (
+        len(intersection) / 3
+    ) * 100
+
+    return {
+        "MSE": float(mse),
+        "RMSE": float(rmse),
+        "MAPE": float(mape),
+        "TOP3_HIT": float(top3_hit)
+    }
+
+
+# ============================================================
+# SAVE RESULTS
+# ============================================================
+
+def save_results(
+    metrics_history,
+    predictions_history
+):
+    """
+    Saves daily metrics and hourly predictions.
+    """
+
+    metrics_df = pd.DataFrame(
+        metrics_history
+    )
+
+    predictions_df = pd.DataFrame(
+        predictions_history
+    )
+
+    metrics_df.to_csv(
+        METRICS_PATH,
+        index=False,
+        encoding="utf-8-sig"
+    )
+
+    predictions_df.to_csv(
+        PREDICTIONS_PATH,
+        index=False,
+        encoding="utf-8-sig"
+    )
+
+
+# ============================================================
+# MONTHLY STATISTICS
+# ============================================================
+
+def save_monthly_statistics(
+    metrics_df
+):
+    """
+    Calculates monthly average metrics.
+    """
+
+    df = metrics_df.copy()
+
+    df["date"] = pd.to_datetime(
+        df["date"]
+    )
+
+    df["month"] = (
+        df["date"].dt.to_period("M")
+    )
+
+    monthly = df.groupby(
+        "month"
+    )[
+        [
+            "MSE",
+            "RMSE",
+            "MAPE",
+            "TOP3_HIT"
+        ]
+    ].agg(
+        [
+            "mean",
+            "median",
+            "std",
+            "min",
+            "max"
+        ]
+    )
+
+    monthly.to_csv(
+        MONTHLY_PATH,
+        encoding="utf-8-sig"
+    )
 
     print(
-        forecast.to_string(
-            index=False,
-            formatters={
-                "predicted_consumption":
-                    lambda x: f"{x:.2f}"
-            }
-        )
+        "\nMonthly statistics saved:"
     )
 
-    return forecast
+    print(MONTHLY_PATH)
 
 
 # ============================================================
-# TOP 3 PEAK HOURS
+# BOXPLOT
 # ============================================================
 
-def find_top_3_peaks(forecast):
-    peaks = (
-        forecast
-        .sort_values(
-            "predicted_consumption",
-            ascending=False
-        )
-        .head(3)
-        .copy()
-    )
-
-    peaks = peaks.sort_values(
-        "datetime"
-    )
-
-    print("\n" + "=" * 70)
-    print("TOP 3 PREDICTED PEAK HOURS")
-    print("=" * 70)
-
-    for _, row in peaks.iterrows():
-        print(
-            f"{row['datetime']}: "
-            f"{row['predicted_consumption']:.2f} MWh"
-        )
-
-    return peaks
-
-
-# ============================================================
-# PLOT FORECAST
-# ============================================================
-
-def plot_forecast(
-    forecast,
-    df,
-    target_date
+def create_boxplot(
+    metrics_df
 ):
-    target_start = pd.Timestamp(
-        target_date
-    )
+    """
+    Creates boxplots for daily metrics.
+    """
 
-    history_start = (
-        target_start
-        - pd.Timedelta(hours=48)
-    )
-
-    history = df.loc[
-        history_start:
-        target_start - pd.Timedelta(hours=1)
+    metrics = [
+        "MSE",
+        "RMSE",
+        "MAPE",
+        "TOP3_HIT"
     ]
 
-    plt.figure(
-        figsize=(14, 6)
+    fig, axes = plt.subplots(
+        2,
+        2,
+        figsize=(14, 10)
     )
 
-    plt.plot(
-        history.index,
-        history["actual_consumption"],
-        label="Actual consumption"
-    )
+    axes = axes.flatten()
 
-    plt.plot(
-        forecast["datetime"],
-        forecast["predicted_consumption"],
-        label="CNN prediction"
-    )
+    for i, metric in enumerate(
+        metrics
+    ):
 
-    plt.axvline(
-        target_start,
-        linestyle="--"
-    )
+        values = metrics_df[
+            metric
+        ].dropna()
 
-    plt.xlabel("Time")
-    plt.ylabel("Consumption, MWh")
+        axes[i].boxplot(
+            values,
+            patch_artist=False
+        )
 
-    plt.title(
-        f"Electricity consumption forecast: "
-        f"{target_date}"
-    )
+        axes[i].set_title(
+            f"Daily {metric} distribution"
+        )
 
-    plt.legend()
-    plt.grid(True)
+        axes[i].set_ylabel(
+            metric
+        )
+
+        axes[i].grid(
+            axis="y",
+            alpha=0.3
+        )
+
     plt.tight_layout()
 
-    filename = os.path.join(
-        RESULTS_DIR,
-        f"forecast_{target_date}.png"
-    )
-
     plt.savefig(
-        filename,
-        dpi=150
+        BOXPLOT_PATH,
+        dpi=300
     )
 
     plt.close()
 
     print(
-        f"\nForecast plot saved to: {filename}"
+        f"Boxplot saved: {BOXPLOT_PATH}"
     )
 
 
 # ============================================================
-# SAVE MODEL
+# SUMMARY
 # ============================================================
 
-def save_model(model, scaler):
-    model.save(
-        MODEL_PATH
-    )
-
-    with open(
-        SCALER_PATH,
-        "wb"
-    ) as file:
-        pickle.dump(
-            scaler,
-            file
-        )
-
-    print("\nModel saved:")
-    print(f"  {MODEL_PATH}")
-    print(f"  {SCALER_PATH}")
-
-
-# ============================================================
-# LOAD MODEL
-# ============================================================
-
-def load_saved_model():
-    if not os.path.exists(
-        MODEL_PATH
-    ):
-        raise FileNotFoundError(
-            f"Model not found: {MODEL_PATH}"
-        )
-
-    if not os.path.exists(
-        SCALER_PATH
-    ):
-        raise FileNotFoundError(
-            f"Scaler not found: {SCALER_PATH}"
-        )
-
-    model = tf.keras.models.load_model(
-        MODEL_PATH
-    )
-
-    with open(
-        SCALER_PATH,
-        "rb"
-    ) as file:
-        scaler = pickle.load(
-            file
-        )
-
-    return model, scaler
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def train_pipeline():
-    ensure_directories()
-
-    df = load_data(DATA_PATH)
-
-    train_df, test_df = split_data(
-        df
-    )
-
-    # Train
-    model, scaler, history = train_model(
-        train_df
-    )
-
-    plot_training_history(history)
-
-    # Test
-    evaluate_model(
-        model,
-        scaler,
-        df,
-        test_df,
-    )
-
-    # Save
-    save_model(
-        model,
-        scaler
-    )
-
-
-def forecast_pipeline(
-    target_date
+def save_summary(
+    metrics_df
 ):
-    df = load_data(
-        DATA_PATH
-    )
+    """
+    Saves final statistics for the evaluation period.
+    """
 
-    model, scaler = load_saved_model()
+    metrics = [
+        "MSE",
+        "RMSE",
+        "MAPE",
+        "TOP3_HIT"
+    ]
 
-    forecast = predict_day(
-        model,
-        scaler,
-        df,
-        target_date
-    )
+    with open(
+        SUMMARY_PATH,
+        "w",
+        encoding="utf-8"
+    ) as file:
 
-    find_top_3_peaks(
-        forecast
-    )
+        file.write(
+            "ROLLING LEARNING — FINAL METRICS\n"
+        )
 
-    plot_forecast(
-        forecast,
-        df,
-        target_date
+        file.write(
+            "=" * 70 + "\n"
+        )
+
+        file.write(
+            f"Evaluation period: "
+            f"{TEST_START} — {TEST_END}\n"
+        )
+
+        file.write(
+            f"Days evaluated: "
+            f"{len(metrics_df)}\n\n"
+        )
+
+        for metric in metrics:
+
+            values = metrics_df[
+                metric
+            ].dropna()
+
+            file.write(
+                f"{metric}\n"
+            )
+
+            file.write(
+                f"Mean:   {values.mean():.4f}\n"
+            )
+
+            file.write(
+                f"Median: {values.median():.4f}\n"
+            )
+
+            file.write(
+                f"Std:    {values.std():.4f}\n"
+            )
+
+            file.write(
+                f"Min:    {values.min():.4f}\n"
+            )
+
+            file.write(
+                f"Max:    {values.max():.4f}\n"
+            )
+
+            file.write(
+                "-" * 50 + "\n"
+            )
+
+    print(
+        f"Summary saved: {SUMMARY_PATH}"
     )
 
 
 # ============================================================
-# COMMAND LINE
+# MAIN ROLLING LEARNING
 # ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(
-        description=(
-            "Day-ahead electricity consumption "
-            "peak forecasting using CNN 1D."
+
+    os.makedirs(
+        RESULTS_DIR,
+        exist_ok=True
+    )
+
+    data = load_data(
+        DATA_PATH
+    )
+
+    # Historical training period
+    train_start = pd.Timestamp(
+        TRAIN_START
+    )
+
+    train_end = pd.Timestamp(
+        TRAIN_END
+    )
+
+    # Evaluation period
+    test_start = pd.Timestamp(
+        TEST_START
+    )
+
+    test_end = pd.Timestamp(
+        TEST_END
+    )
+
+    # Initial historical data
+    historical_data = data.loc[
+        train_start:train_end,
+        "actual_consumption"
+    ].copy()
+
+    # Data available for evaluation
+    test_data = data.loc[
+        test_start:test_end,
+        "actual_consumption"
+    ].copy()
+
+    if historical_data.empty:
+        raise ValueError(
+            "Historical training data is empty."
         )
-    )
 
-    parser.add_argument(
-        "--mode",
-        choices=[
-            "train",
-            "predict"
-        ],
-        default="train"
-    )
-
-    parser.add_argument(
-        "--date",
-        type=str,
-        help=(
-            "Date for prediction, "
-            "e.g. 2025-07-01"
+    if test_data.empty:
+        raise ValueError(
+            "No evaluation data for 2026."
         )
+
+    # Generate all forecast dates
+    forecast_dates = pd.date_range(
+        start=test_start.normalize(),
+        end=test_end.normalize(),
+        freq="D"
     )
 
-    args = parser.parse_args()
+    metrics_history = []
+    predictions_history = []
 
-    if args.mode == "train":
-        train_pipeline()
+    print("\n")
+    print("=" * 70)
+    print("ROLLING LEARNING — 2026")
+    print("=" * 70)
 
-    elif args.mode == "predict":
+    print(
+        f"Initial training period: "
+        f"{TRAIN_START} — {TRAIN_END}"
+    )
 
-        if not args.date:
-            raise ValueError(
-                "--date is required in predict mode."
+    print(
+        f"Evaluation period: "
+        f"{TEST_START} — {TEST_END}"
+    )
+
+    print(
+        f"Forecast days: "
+        f"{len(forecast_dates)}"
+    )
+
+    # --------------------------------------------------------
+    # MAIN LOOP
+    # --------------------------------------------------------
+
+    for day_number, forecast_date in enumerate(
+        forecast_dates,
+        start=1
+    ):
+
+        print("\n")
+        print("-" * 70)
+
+        print(
+            f"DAY {day_number}/"
+            f"{len(forecast_dates)}"
+        )
+
+        print(
+            f"Forecast date: "
+            f"{forecast_date.date()}"
+        )
+
+        # ----------------------------------------------------
+        # 1. Get historical data before forecast date
+        # ----------------------------------------------------
+
+        available_history = data.loc[
+            train_start:
+            forecast_date - pd.Timedelta(hours=1),
+            "actual_consumption"
+        ].copy()
+
+        if available_history.empty:
+            print(
+                "Skipping: no historical data."
+            )
+            continue
+
+        # ----------------------------------------------------
+        # 2. Get the actual 24 hours for evaluation
+        # ----------------------------------------------------
+
+        day_end = (
+            forecast_date
+            + pd.Timedelta(hours=23)
+        )
+
+        actual_day = data.loc[
+            forecast_date:day_end,
+            "actual_consumption"
+        ]
+
+        if len(actual_day) != 24:
+            print(
+                "Skipping: the day does not "
+                "contain 24 hourly observations."
+            )
+            continue
+
+        if actual_day.isna().any():
+            print(
+                "Skipping: actual values "
+                "contain missing observations."
+            )
+            continue
+
+        # ----------------------------------------------------
+        # 3. Train the model
+        # ----------------------------------------------------
+
+        print(
+            "Training CNN..."
+        )
+
+        model, mean, std = train_model(
+            available_history.values
+        )
+
+        # ----------------------------------------------------
+        # 4. Forecast the next 24 hours
+        # ----------------------------------------------------
+
+        print(
+            "Predicting next 24 hours..."
+        )
+
+        predictions = predict_day(
+            model,
+            available_history.values,
+            mean,
+            std
+        )
+
+        actual = actual_day.values
+
+        # ----------------------------------------------------
+        # 5. Calculate daily metrics
+        # ----------------------------------------------------
+
+        daily_metrics = calculate_metrics(
+            actual,
+            predictions
+        )
+
+        daily_metrics["date"] = (
+            forecast_date.strftime(
+                "%Y-%m-%d"
+            )
+        )
+
+        metrics_history.append(
+            daily_metrics
+        )
+
+        # ----------------------------------------------------
+        # 6. Save hourly predictions
+        # ----------------------------------------------------
+
+        for hour in range(
+            FORECAST_HORIZON
+        ):
+
+            predictions_history.append(
+                {
+                    "date": forecast_date.strftime(
+                        "%Y-%m-%d"
+                    ),
+
+                    "hour": hour,
+
+                    "actual_consumption": float(
+                        actual[hour]
+                    ),
+
+                    "predicted_consumption": float(
+                        predictions[hour]
+                    )
+                }
             )
 
-        forecast_pipeline(
-            args.date
+        # ----------------------------------------------------
+        # 7. Print daily results
+        # ----------------------------------------------------
+
+        print(
+            f"MSE:      "
+            f"{daily_metrics['MSE']:.4f}"
         )
 
+        print(
+            f"RMSE:     "
+            f"{daily_metrics['RMSE']:.4f}"
+        )
+
+        print(
+            f"MAPE:     "
+            f"{daily_metrics['MAPE']:.4f}%"
+        )
+
+        print(
+            f"TOP-3 HIT:"
+            f" {daily_metrics['TOP3_HIT']:.2f}%"
+        )
+
+        # ----------------------------------------------------
+        # 8. Save results after every day
+        # ----------------------------------------------------
+
+        save_results(
+            metrics_history,
+            predictions_history
+        )
+
+        print(
+            "Daily results saved."
+        )
+
+        # ----------------------------------------------------
+        # 9. The next iteration automatically includes
+        #    this day's actual data in historical_data.
+        #
+        #    No manual append is required because the next
+        #    iteration reads all available data before
+        #    its forecast date.
+        # ----------------------------------------------------
+
+        del model
+
+        tf.keras.backend.clear_session()
+
+    # ========================================================
+    # FINAL RESULTS
+    # ========================================================
+
+    if len(metrics_history) == 0:
+        raise RuntimeError(
+            "No days were successfully evaluated."
+        )
+
+    metrics_df = pd.DataFrame(
+        metrics_history
+    )
+
+    print("\n")
+    print("=" * 70)
+    print("ROLLING LEARNING — FINAL RESULTS")
+    print("=" * 70)
+
+    print(
+        f"Successfully evaluated days: "
+        f"{len(metrics_df)}"
+    )
+
+    print(
+        metrics_df[
+            [
+                "MSE",
+                "RMSE",
+                "MAPE",
+                "TOP3_HIT"
+            ]
+        ].describe()
+    )
+
+    # Save final files
+    save_results(
+        metrics_history,
+        predictions_history
+    )
+
+    save_monthly_statistics(
+        metrics_df
+    )
+
+    create_boxplot(
+        metrics_df
+    )
+
+    save_summary(
+        metrics_df
+    )
+
+    print("\n")
+    print("=" * 70)
+    print("PROGRAM FINISHED")
+    print("=" * 70)
+
+    print(
+        f"Results directory:\n"
+        f"{RESULTS_DIR}"
+    )
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
     main()
