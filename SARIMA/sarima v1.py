@@ -163,6 +163,8 @@ def main():
         total_peaks = 0
 
         for start_idx in range(0, len(full_2026_index), FORECAST_STEP):
+            if start_idx % (24 * 30) == 0:
+                print(f"[{region_name}] Обработано {start_idx // 24} / 365 дней...")
             step_index = full_2026_index[start_idx : start_idx + FORECAST_STEP]
             n_steps = len(step_index)
             if n_steps == 0:
