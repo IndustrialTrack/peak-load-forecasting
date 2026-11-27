@@ -37,6 +37,12 @@ DATA_PATH = os.path.join(
     "electricity_75.csv"
 )
 
+# Regions used as shared context. The target is TARGET_REGION; every other
+# region is an input feature. Set to None to keep the original single-region run.
+MULTI_REGION = True
+TARGET_REGION = "Челябинская область"
+CONTEXT_REGIONS = ["Челябинская область", "Пермский край", "Свердловская область"]
+
 # Historical data used for training
 TRAIN_START = "2021-01-01"
 TRAIN_END = "2025-12-31 23:00:00"
@@ -107,7 +113,7 @@ tf.keras.utils.set_random_seed(RANDOM_SEED)
 # DATA LOADING
 # ============================================================
 
-def load_data(path):
+def load_data(path, regions=None):
     """
     Loads the dataset and creates a continuous hourly time series.
     """
@@ -121,10 +127,10 @@ def load_data(path):
             f"Dataset not found:\n{path}"
         )
 
-    df = pd.read_csv(
-        path,
-        encoding="utf-8-sig"
-    )
+    try:
+        df = pd.read_csv(path, encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        df = pd.read_csv(path, encoding="cp1251")
 
     required_columns = [
         "date",
@@ -170,20 +176,21 @@ def load_data(path):
         + pd.to_timedelta(df["hour"], unit="h")
     )
 
-    df = df[
-        [
-            "timestamp",
-            "actual_consumption"
-        ]
-    ]
+    if regions and "region_name" in df.columns:
+        df = df[df["region_name"].isin(regions)][["timestamp", "region_name", "actual_consumption"]]
+        df = df.pivot_table(index="timestamp", columns="region_name", values="actual_consumption", aggfunc="last")
+        missing_regions = set(regions) - set(df.columns)
+        if missing_regions:
+            raise ValueError(f"Regions absent from dataset: {sorted(missing_regions)}")
+        df = df.reindex(columns=regions)
+    else:
+        df = df[["timestamp", "actual_consumption"]]
 
     df = df.sort_values("timestamp")
 
     # Remove duplicate timestamps.
-    df = df.drop_duplicates(
-        subset="timestamp",
-        keep="last"
-    )
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df = df.drop_duplicates(subset="timestamp", keep="last").set_index("timestamp")
 
     df = df.set_index("timestamp")
 
@@ -202,7 +209,7 @@ def load_data(path):
     print(f"Start: {df.index.min()}")
     print(f"End:   {df.index.max()}")
 
-    missing = df["actual_consumption"].isna().sum()
+    missing = int(df.isna().sum().sum())
 
     print(f"Missing hourly values: {missing}")
 
